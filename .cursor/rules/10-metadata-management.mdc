@@ -1,0 +1,240 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Iceberg 元数据管理
+
+Iceberg的一个核心优势是其强大的元数据管理系统。本规则文件详细介绍Iceberg如何管理和演化表元数据。
+
+## 元数据结构
+
+### 元数据文件层次结构
+
+Iceberg使用多层次的元数据文件来管理表：
+
+1. **元数据文件（Metadata Files）**: 存储表的所有元数据信息
+2. **清单列表（Manifest Lists）**: 跟踪表的所有清单文件
+3. **清单文件（Manifest Files）**: 跟踪表中的数据文件
+4. **数据文件（Data Files）**: 存储实际数据
+
+```
+表元数据文件（metadata/v*.json）
+  |
+  +-- 清单列表文件（*.avro）
+       |
+       +-- 清单文件（*.avro）
+            |
+            +-- 数据文件（*.parquet/*.avro/*.orc）
+```
+
+### TableMetadata
+
+[TableMetadata](mdc:core/src/main/java/org/apache/iceberg/TableMetadata.java)是表元数据的核心类，包含以下关键信息：
+
+```java
+public class TableMetadata {
+  private final String location;
+  private final long lastUpdatedMillis;
+  private final long lastColumnId;
+  private final Schema schema;
+  private final PartitionSpec spec;
+  private final SortOrder sortOrder;
+  private final Map<String, String> properties;
+  private final long currentSnapshotId;
+  private final List<Snapshot> snapshots;
+  private final Map<String, SnapshotRef> refs;
+  // ...
+}
+```
+
+主要组成部分：
+- `location`: 表位置
+- `schema`: 表模式
+- `spec`: 分区规范
+- `snapshots`: 表的所有快照
+- `currentSnapshotId`: 当前快照ID
+- `refs`: 命名引用（如main、prod等）
+
+## 元数据管理核心组件
+
+### TableOperations
+
+[TableOperations](mdc:core/src/main/java/org/apache/iceberg/TableOperations.java)是管理元数据文件的核心接口：
+
+```java
+public interface TableOperations {
+  TableMetadata current();
+  TableMetadata refresh();
+  void commit(TableMetadata base, TableMetadata metadata);
+  String metadataFileLocation(String fileName);
+  FileIO io();
+  EncryptionManager encryption();
+  long newSnapshotId();
+}
+```
+
+主要实现：
+- [HadoopTableOperations](mdc:core/src/main/java/org/apache/iceberg/hadoop/HadoopTableOperations.java): 基于Hadoop的实现
+- [BaseMetastoreCatalogTableOperations](mdc:core/src/main/java/org/apache/iceberg/BaseMetastoreCatalogTableOperations.java): 基于元数据存储的实现
+
+### MetadataUpdate
+
+[MetadataUpdate](mdc:core/src/main/java/org/apache/iceberg/MetadataUpdate.java)定义了元数据更新操作：
+
+```java
+public abstract class MetadataUpdate implements Serializable {
+  public static class AssignUUID extends MetadataUpdate { /* ... */ }
+  public static class UpgradeFormatVersion extends MetadataUpdate { /* ... */ }
+  public static class AddSchema extends MetadataUpdate { /* ... */ }
+  public static class SetDefaultSchema extends MetadataUpdate { /* ... */ }
+  public static class AddPartitionSpec extends MetadataUpdate { /* ... */ }
+  public static class SetDefaultSpec extends MetadataUpdate { /* ... */ }
+  public static class AddSortOrder extends MetadataUpdate { /* ... */ }
+  public static class SetDefaultSortOrder extends MetadataUpdate { /* ... */ }
+  public static class SetProperties extends MetadataUpdate { /* ... */ }
+  public static class RemoveProperties extends MetadataUpdate { /* ... */ }
+  public static class SetLocation extends MetadataUpdate { /* ... */ }
+  public static class SetCurrentSnapshot extends MetadataUpdate { /* ... */ }
+  public static class SetSnapshotRef extends MetadataUpdate { /* ... */ }
+  public static class RemoveSnapshotRef extends MetadataUpdate { /* ... */ }
+  public static class RemoveSnapshots extends MetadataUpdate { /* ... */ }
+  public static class AddSnapshot extends MetadataUpdate { /* ... */ }
+}
+```
+
+## 快照管理
+
+### Snapshot
+
+[Snapshot](mdc:api/src/main/java/org/apache/iceberg/Snapshot.java)表示表在特定时间点的状态：
+
+```java
+public interface Snapshot {
+  long snapshotId();
+  Long parentId();
+  long timestampMillis();
+  String operation();
+  Map<String, String> summary();
+  
+  int sequenceNumber();
+  String manifestListLocation();
+  List<ManifestFile> manifests();
+  List<DataFile> addedFiles();
+  List<DataFile> removedFiles();
+}
+```
+
+每个快照包含：
+- 唯一的快照ID
+- 父快照ID
+- 创建时间戳
+- 操作类型（如append、delete等）
+- 清单文件列表
+
+### SnapshotManager
+
+[SnapshotManager](mdc:core/src/main/java/org/apache/iceberg/SnapshotManager.java)提供了管理快照的功能：
+
+```java
+// 示例：使用SnapshotManager管理快照
+SnapshotManager manager = table.manageSnapshots();
+
+// 创建一个分支
+manager.createTag("historical-tag", snapshotId);
+
+// 创建一个分支
+manager.createBranch("experimental-branch", snapshotId);
+
+// 快照回滚
+manager.rollbackTo(previousSnapshotId).commit();
+
+// 快照过期
+manager.expireSnapshots()
+    .expireOlderThan(timestamp)
+    .retainLast(5)
+    .commit();
+```
+
+## 元数据演化与版本控制
+
+### 元数据版本
+
+Iceberg使用版本号跟踪元数据文件：
+- `v1.metadata.json`
+- `v2.metadata.json`
+- ...
+
+每次提交创建一个新的元数据版本文件，确保原子性和隔离性。
+
+### 元数据文件格式
+
+元数据文件使用JSON格式存储，便于读取和调试：
+
+```json
+{
+  "format-version": 2,
+  "table-uuid": "fb072c92-a02b-11e9-ae9c-1bb7bc9eca94",
+  "location": "s3://bucket/table",
+  "last-updated-ms": 1625160516910,
+  "last-column-id": 22,
+  "schema": { /* ... */ },
+  "partition-spec": [ /* ... */ ],
+  "sort-order": [ /* ... */ ],
+  "properties": { /* ... */ },
+  "current-snapshot-id": 3055729675574597004,
+  "snapshots": [ /* ... */ ],
+  "snapshot-log": [ /* ... */ ],
+  "metadata-log": [ /* ... */ ]
+}
+```
+
+## 元数据表
+
+Iceberg提供特殊的元数据表来查询表的内部状态：
+
+- `table_name.snapshots`: 所有快照的详细信息
+- `table_name.history`: 表修改历史
+- `table_name.files`: 表中的所有数据文件
+- `table_name.manifests`: 表中的所有清单文件
+- `table_name.partitions`: 表的分区统计信息
+
+```java
+// 示例：访问元数据表
+Table filesTable = table.metadataTableInstance(MetadataTableType.FILES);
+TableScan scan = filesTable.newScan();
+try (CloseableIterable<FileScanTask> tasks = scan.planFiles()) {
+  // 处理文件扫描任务
+}
+```
+
+## 元数据性能优化
+
+### 元数据索引
+
+Iceberg使用多种索引加速元数据访问：
+- 分区索引：在清单文件中存储分区边界
+- 位置索引：跟踪数据文件位置
+- 列统计索引：存储列级统计信息
+
+### 增量元数据读取
+
+Iceberg支持增量读取元数据，避免读取整个表状态：
+
+```java
+// 从特定快照开始读取增量变化
+Snapshot start = table.snapshot(startSnapshotId);
+Iterable<DataFile> addedFiles = start.addedFiles();
+```
+
+### 元数据缓存
+
+[MetadataTableScan](mdc:core/src/main/java/org/apache/iceberg/MetadataTableScan.java)实现了元数据缓存以提高性能：
+
+```java
+public class MetadataTableScan extends BaseTableScan {
+  // 缓存元数据表扫描结果
+  private final MetadataTableType metadataTableType;
+  // ...
+}
+```

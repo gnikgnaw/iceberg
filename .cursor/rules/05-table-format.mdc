@@ -1,0 +1,80 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Iceberg 表格式与文件系统
+
+Iceberg表格式是一种开放的表格式，设计用于处理大规模数据分析工作负载。它提供了快照隔离、架构演化、分区演化和高效的数据文件管理。
+
+## 表格式结构
+
+### 元数据文件
+
+- **元数据文件（Metadata Files）**: 包含表的所有元数据，如schema、分区、快照等
+- **清单列表（Manifest Lists）**: 列出表中的所有清单文件
+- **清单文件（Manifest Files）**: 列出表中的所有数据文件，包括它们的统计信息
+- **数据文件（Data Files）**: 包含表的实际数据
+
+### 文件组织
+
+```
+表元数据
+  |
+  +-- 清单列表（按快照组织）
+       |
+       +-- 清单文件1（包含数据文件列表和统计信息）
+       |    |
+       |    +-- 数据文件1 (Parquet/Avro/ORC)
+       |    +-- 数据文件2 (Parquet/Avro/ORC)
+       |
+       +-- 清单文件2
+            |
+            +-- 数据文件3 (Parquet/Avro/ORC)
+            +-- 数据文件4 (Parquet/Avro/ORC)
+```
+
+## 文件格式支持
+
+- **Parquet**: 默认的列式存储格式
+  - [ParquetUtil](mdc:parquet/src/main/java/org/apache/iceberg/parquet/ParquetUtil.java): Parquet工具类
+  - [ParquetWriter](mdc:parquet/src/main/java/org/apache/iceberg/parquet/ParquetWriter.java): Parquet写入工具
+
+- **Avro**: 用于序列化元数据和行式数据
+  - [AvroSchemaUtil](mdc:core/src/main/java/org/apache/iceberg/avro/AvroSchemaUtil.java): Avro schema转换工具
+  - [AvroFileWriter](mdc:core/src/main/java/org/apache/iceberg/avro/AvroFileWriter.java): Avro文件写入工具
+
+- **ORC**: 另一种列式存储格式
+  - [OrcFileFormat](mdc:orc/src/main/java/org/apache/iceberg/orc/OrcFileFormat.java): ORC文件格式支持
+  - [OrcWriter](mdc:orc/src/main/java/org/apache/iceberg/orc/OrcWriter.java): ORC写入工具
+
+## 文件系统集成
+
+### 本地文件系统
+
+- [LocalFileIO](mdc:core/src/main/java/org/apache/iceberg/io/LocalFileIO.java): 本地文件系统的实现
+
+### Hadoop文件系统
+
+- [HadoopFileIO](mdc:core/src/main/java/org/apache/iceberg/hadoop/HadoopFileIO.java): Hadoop文件系统的实现
+
+### 云存储集成
+
+- **AWS S3**:
+  - [S3FileIO](mdc:aws/src/main/java/org/apache/iceberg/aws/s3/S3FileIO.java): S3文件系统的实现
+
+- **Azure Blob Storage**:
+  - [AzureFileIO](mdc:azure/src/main/java/org/apache/iceberg/azure/AzureFileIO.java): Azure Blob Storage的实现
+
+- **Google Cloud Storage**:
+  - [GcsFileIO](mdc:gcp/src/main/java/org/apache/iceberg/gcp/gcs/GcsFileIO.java): Google Cloud Storage的实现
+
+## 表演化与兼容性
+
+Iceberg的表格式支持以下演化方式：
+
+- **Schema演化**: 添加、删除、重命名和重排列列
+- **分区演化**: 更改表的分区方案
+- **数据文件优化**: 压缩、排序和过滤数据文件
+
+所有这些更改都是向后兼容的，不会破坏现有的读取器。

@@ -1,0 +1,106 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Iceberg 事务与并发控制
+
+Iceberg提供了事务支持，允许多个操作作为一个原子单元提交。这确保了在并发环境中的数据一致性。
+
+## 核心概念
+
+### 事务接口与实现
+
+- [Transaction](mdc:api/src/main/java/org/apache/iceberg/Transaction.java): 表示表的事务接口
+  ```java
+  public interface Transaction {
+    Table table();
+    UpdateSchema updateSchema();
+    UpdatePartitionSpec updateSpec();
+    UpdateProperties updateProperties();
+    ReplaceSortOrder replaceSortOrder();
+    UpdateLocation updateLocation();
+    AppendFiles newAppend();
+    RewriteFiles newRewrite();
+    RewriteManifests newRewriteManifests();
+    DeleteFiles newDelete();
+    ExpireSnapshots expireSnapshots();
+    ManageSnapshots manageSnapshots();
+    void commitTransaction();
+  }
+  ```
+
+- [BaseTransaction](mdc:core/src/main/java/org/apache/iceberg/BaseTransaction.java): 事务的基础实现
+
+### 快照与并发控制
+
+- [Snapshot](mdc:api/src/main/java/org/apache/iceberg/Snapshot.java): 表示表在特定时间点的状态
+- [SnapshotManager](mdc:core/src/main/java/org/apache/iceberg/SnapshotManager.java): 管理表快照的工具
+
+## 乐观并发控制
+
+Iceberg使用乐观并发控制来处理并发写入：
+
+1. **读取当前状态**: 事务开始时读取表的当前状态
+2. **准备更改**: 准备对表进行更改，但不立即应用
+3. **检查冲突**: 提交时检查表状态是否已更改
+4. **提交或重试**: 如果没有冲突，则提交更改；否则重试事务
+
+### 实现细节
+
+- [TableMetadata](mdc:core/src/main/java/org/apache/iceberg/TableMetadata.java): 存储表的当前状态，包括当前快照ID
+- [TableOperations](mdc:core/src/main/java/org/apache/iceberg/TableOperations.java): 提供乐观锁机制实现
+  ```java
+  public interface TableOperations {
+    TableMetadata current();
+    TableMetadata refresh();
+    void commit(TableMetadata base, TableMetadata metadata);
+    // ...
+  }
+  ```
+
+## 事务示例
+
+### 基本事务使用
+
+```java
+// 开始事务
+Transaction txn = table.newTransaction();
+
+// 准备多个操作
+txn.newAppend()
+    .appendFile(dataFile1)
+    .appendFile(dataFile2)
+    .commit();
+
+txn.updateSchema()
+    .addColumn("new_column", Types.LongType.get())
+    .commit();
+
+// 原子提交所有操作
+txn.commitTransaction();
+```
+
+### Flink事务集成
+
+```java
+// 在Flink中使用事务
+FlinkCatalog catalog = ...; // 获取Flink目录
+catalog.beginTransaction("db", "table", txnId);
+catalog.commitTransaction("db", "table", txnId);
+```
+
+## 事务隔离级别
+
+Iceberg提供以下隔离级别：
+
+- **快照隔离**: 读取操作始终看到表的一致快照
+- **序列化**: 通过乐观并发控制实现事务的序列化执行
+
+## 冲突解决
+
+当发生冲突时，Iceberg提供了几种解决策略：
+
+- **重试**: 再次尝试事务
+- **合并**: 合并冲突的更改（适用于某些操作）
+- **放弃**: 放弃事务并通知用户

@@ -1,0 +1,152 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Iceberg 数据模型与类型系统
+
+Iceberg具有丰富的数据模型和类型系统，为表结构提供了强大的支持。本规则文件详细介绍数据模型的组成和类型系统的工作原理。
+
+## 数据模型
+
+### Schema（模式）
+
+[Schema](mdc:api/src/main/java/org/apache/iceberg/Schema.java)是Iceberg表的基础，定义了表中的字段及其类型。
+
+```java
+// Schema示例
+Schema schema = new Schema(
+    Types.NestedField.required(1, "id", Types.LongType.get()),
+    Types.NestedField.optional(2, "data", Types.StringType.get()),
+    Types.NestedField.required(3, "category", Types.StringType.get())
+);
+```
+
+关键组成部分：
+- `NestedField`: 表示Schema中的字段，可以是必需的或可选的
+- `fieldId`: 每个字段都有一个唯一的ID，用于跟踪架构演化
+
+### 类型系统
+
+Iceberg支持丰富的数据类型，定义在[Types](mdc:api/src/main/java/org/apache/iceberg/types/Types.java)类中：
+
+#### 原始类型
+
+- `BooleanType`: 布尔值
+- `IntegerType`: 32位有符号整数
+- `LongType`: 64位有符号整数
+- `FloatType`: 32位浮点数
+- `DoubleType`: 64位浮点数
+- `DateType`: 日期，精确到天
+- `TimeType`: 时间，精确到微秒
+- `TimestampType`: 时间戳，精确到微秒，可以带时区
+- `StringType`: UTF-8字符串
+- `UUIDType`: 128位UUID
+- `BinaryType`: 二进制数据
+- `DecimalType`: 固定精度小数
+
+#### 复杂类型
+
+- `ListType`: 列表类型，包含元素类型
+- `MapType`: 映射类型，包含键类型和值类型
+- `StructType`: 结构类型，包含多个命名字段
+
+### 分区规范
+
+[PartitionSpec](mdc:api/src/main/java/org/apache/iceberg/PartitionSpec.java)定义了表的分区方式。它包含一组分区字段，每个字段由源列和转换组成。
+
+```java
+// 分区规范示例
+PartitionSpec spec = PartitionSpec.builderFor(schema)
+    .identity("category")
+    .day("timestamp")
+    .bucket("id", 16)
+    .build();
+```
+
+支持的分区转换：
+- `identity`: 直接使用字段值
+- `year/month/day/hour`: 从时间戳提取时间单位
+- `bucket`: 将值散列到固定数量的桶中
+- `truncate`: 截断字符串或数字
+
+### 排序顺序
+
+[SortOrder](mdc:api/src/main/java/org/apache/iceberg/SortOrder.java)定义了数据在文件中的排序方式。
+
+```java
+// 排序顺序示例
+SortOrder order = SortOrder.builderFor(schema)
+    .asc("category", NullOrder.NULLS_FIRST)
+    .desc("id", NullOrder.NULLS_LAST)
+    .build();
+```
+
+## 类型系统实现
+
+### 类型转换与操作
+
+- [TypeUtil](mdc:api/src/main/java/org/apache/iceberg/types/TypeUtil.java): 提供类型操作和转换工具
+- [TypeConverter](mdc:api/src/main/java/org/apache/iceberg/types/TypeConverter.java): 将Iceberg类型转换为其他类型系统的接口
+
+### 类型访问者模式
+
+Iceberg使用访问者模式处理类型，定义在[TypeVisitor](mdc:api/src/main/java/org/apache/iceberg/types/TypeVisitor.java)中：
+
+```java
+// 使用类型访问者示例
+class TypePrinter extends TypeVisitor<Void> {
+  @Override
+  public Void primitive(Type.PrimitiveType type) {
+    System.out.println("Primitive: " + type);
+    return null;
+  }
+  
+  @Override
+  public Void struct(Types.StructType type) {
+    System.out.println("Struct with " + type.fields().size() + " fields");
+    return null;
+  }
+  
+  // 其他访问者方法...
+}
+```
+
+## Schema演化
+
+Iceberg支持丰富的Schema演化能力，实现在[SchemaUpdate](mdc:core/src/main/java/org/apache/iceberg/SchemaUpdate.java)中：
+
+```java
+// Schema演化示例
+Schema updated = new SchemaUpdate(schema, 1)
+    .addColumn("new_field", Types.LongType.get())
+    .renameColumn("data", "content")
+    .updateColumn("id", Types.IntegerType.get())
+    .deleteColumn("category")
+    .apply();
+```
+
+支持的演化操作：
+- 添加新列
+- 删除现有列
+- 重命名列
+- 更改列类型（在兼容的情况下）
+- 重新排列列
+
+## 内部实现细节
+
+### ID分配
+
+- [TableOperations](mdc:core/src/main/java/org/apache/iceberg/TableOperations.java): 负责为新字段分配唯一ID
+- [TableMetadata](mdc:core/src/main/java/org/apache/iceberg/TableMetadata.java): 跟踪当前最高的字段ID
+
+### 类型投影
+
+- [SchemaProjection](mdc:core/src/main/java/org/apache/iceberg/SchemaProjection.java): 将记录从一个Schema投影到另一个Schema
+- [ProjectionUtil](mdc:core/src/main/java/org/apache/iceberg/util/ProjectionUtil.java): 提供用于投影的工具方法
+
+### 与文件格式的集成
+
+- [ParquetSchemaUtil](mdc:parquet/src/main/java/org/apache/iceberg/parquet/ParquetSchemaUtil.java): 在Iceberg和Parquet类型之间转换
+- [AvroSchemaUtil](mdc:core/src/main/java/org/apache/iceberg/avro/AvroSchemaUtil.java): 在Iceberg和Avro类型之间转换
+- [OrcSchemaUtil](mdc:orc/src/main/java/org/apache/iceberg/orc/OrcSchemaUtil.java): 在Iceberg和ORC类型之间转换

@@ -1,0 +1,56 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Iceberg Core 模块
+
+Core模块实现了Iceberg API并提供了处理表的核心功能。这是处理引擎应该依赖的主要模块。
+
+## 核心实现类
+
+### 表实现
+
+- [BaseTable](mdc:core/src/main/java/org/apache/iceberg/BaseTable.java): Table接口的基础实现
+- [StaticTable](mdc:core/src/main/java/org/apache/iceberg/StaticTable.java): 不可变表的实现
+- [MutableTable](mdc:core/src/main/java/org/apache/iceberg/MutableTable.java): 可变表的实现
+
+### 元数据管理
+
+- [TableMetadata](mdc:core/src/main/java/org/apache/iceberg/TableMetadata.java): 表的元数据，包括schema、分区规范和快照
+- [TableOperations](mdc:core/src/main/java/org/apache/iceberg/TableOperations.java): 表操作的抽象，处理元数据文件的读写
+- [MetadataTableUtils](mdc:core/src/main/java/org/apache/iceberg/MetadataTableUtils.java): 处理元数据表的工具类
+
+### 表操作实现
+
+- [BaseTransaction](mdc:core/src/main/java/org/apache/iceberg/BaseTransaction.java): 事务接口的实现
+- [BaseAppendFiles](mdc:core/src/main/java/org/apache/iceberg/BaseAppendFiles.java): 添加文件操作的实现
+- [BaseRewriteFiles](mdc:core/src/main/java/org/apache/iceberg/BaseRewriteFiles.java): 重写文件操作的实现
+- [BaseDeleteFiles](mdc:core/src/main/java/org/apache/iceberg/BaseDeleteFiles.java): 删除文件操作的实现
+
+### 表扫描实现
+
+- [BaseTableScan](mdc:core/src/main/java/org/apache/iceberg/BaseTableScan.java): 表扫描接口的基础实现
+- [DataTableScan](mdc:core/src/main/java/org/apache/iceberg/DataTableScan.java): 数据表扫描的实现
+
+### 文件格式
+
+- [GenericDataFile](mdc:core/src/main/java/org/apache/iceberg/GenericDataFile.java): DataFile接口的通用实现
+- [GenericDeleteFile](mdc:core/src/main/java/org/apache/iceberg/GenericDeleteFile.java): DeleteFile接口的通用实现
+- [ManifestReader](mdc:core/src/main/java/org/apache/iceberg/ManifestReader.java): 读取清单文件的工具
+- [ManifestWriter](mdc:core/src/main/java/org/apache/iceberg/ManifestWriter.java): 写入清单文件的工具
+
+## 表演化
+
+- [SchemaUpdate](mdc:core/src/main/java/org/apache/iceberg/SchemaUpdate.java): 实现Schema更新操作
+- [SetCurrentSchemaUpdate](mdc:core/src/main/java/org/apache/iceberg/SetCurrentSchemaUpdate.java): 设置当前Schema的操作
+
+## Avro支持
+
+- [AvroSchemaUtil](mdc:core/src/main/java/org/apache/iceberg/avro/AvroSchemaUtil.java): 转换Iceberg Schema和Avro Schema的工具
+- [GenericAvroReader](mdc:core/src/main/java/org/apache/iceberg/avro/GenericAvroReader.java): 从Avro文件读取数据的通用读取器
+
+## IO操作
+
+- [FileIO](mdc:core/src/main/java/org/apache/iceberg/io/FileIO.java): 文件IO操作的抽象，处理不同存储系统
+- [CloseableIterable](mdc:core/src/main/java/org/apache/iceberg/io/CloseableIterable.java): 可关闭的迭代器接口

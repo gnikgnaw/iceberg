@@ -1,0 +1,44 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Apache Iceberg 项目概览
+
+Apache Iceberg 是一种用于大型分析表的高性能格式。它为大数据带来了SQL表的可靠性和简单性，同时使像Spark、Trino、Flink、Presto、Hive和Impala等引擎能够安全地同时处理相同的表。
+
+## 项目结构
+
+Iceberg表支持组织在以下核心库模块中：
+
+- `iceberg-common`: 包含在其他模块中使用的实用工具类
+- `iceberg-api`: 包含公共Iceberg API
+- `iceberg-core`: 包含Iceberg API的实现和对Avro数据文件的支持（处理引擎应依赖此模块）
+- `iceberg-parquet`: 用于处理由Parquet文件支持的表的可选模块
+- `iceberg-arrow`: 用于将Parquet读入Arrow内存的可选模块
+- `iceberg-orc`: 用于处理由ORC文件支持的表的可选模块
+- `iceberg-hive-metastore`: 由Hive metastore Thrift客户端支持的Iceberg表的实现
+- `iceberg-data`: 用于直接从JVM应用程序处理表的可选模块
+
+Iceberg还具有为处理引擎添加Iceberg支持的模块：
+
+- `iceberg-spark`: 针对Iceberg的Spark Datasource V2 API的实现，带有各个spark版本的子模块
+- `iceberg-flink`: 包含与Apache Flink集成的类
+- `iceberg-mr`: 包含InputFormat和其他用于与Apache Hive集成的类
+- `iceberg-pig`: 针对Iceberg的Pig LoadFunc API的实现
+
+## 常见缩写解释
+
+- `txn`: Transaction（事务）
+- `op`: Operation（操作）
+- `expr`: Expression（表达式）
+- `impl`: Implementation（实现）
+- `mgr`: Manager（管理器）
+- `meta`: Metadata（元数据）
+- `serde`: Serialization/Deserialization（序列化/反序列化）
+
+## 项目文档
+
+详细的背景资料和文档可在[Iceberg官方网站](https://iceberg.apache.org)找到。
+- [Iceberg规范](https://iceberg.apache.org/spec)定义了表格式和操作
+- [Iceberg文档](https://iceberg.apache.org/docs/latest/)提供了所有库和集成的信息

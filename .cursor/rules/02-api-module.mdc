@@ -1,0 +1,50 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Iceberg API 模块
+
+API模块定义了Iceberg的核心接口和抽象，为其他模块提供基础。
+
+## 核心概念
+
+### Table接口
+
+[Table](mdc:api/src/main/java/org/apache/iceberg/Table.java)是Iceberg的核心接口，代表一个Iceberg表。主要功能包括：
+
+- 提供表的模式（schema）和分区信息
+- 读取和修改表的元数据
+- 创建数据文件扫描器（Scanner）
+- 创建表的事务（Transaction）
+
+### Schema相关接口
+
+- [Schema](mdc:api/src/main/java/org/apache/iceberg/Schema.java): 定义表的结构，包含列和类型
+- [Types](mdc:api/src/main/java/org/apache/iceberg/types/Types.java): 定义Iceberg支持的数据类型
+- [PartitionSpec](mdc:api/src/main/java/org/apache/iceberg/PartitionSpec.java): 定义表的分区规范
+
+### 数据操作接口
+
+- [DataFile](mdc:api/src/main/java/org/apache/iceberg/DataFile.java): 表示存储表数据的物理文件
+- [DeleteFile](mdc:api/src/main/java/org/apache/iceberg/DeleteFile.java): 表示存储删除数据的物理文件
+- [Snapshot](mdc:api/src/main/java/org/apache/iceberg/Snapshot.java): 表示表在特定时间点的状态
+- [ManifestFile](mdc:api/src/main/java/org/apache/iceberg/ManifestFile.java): 元数据文件，列出表中的数据文件
+
+### 表操作接口
+
+- [AppendFiles](mdc:api/src/main/java/org/apache/iceberg/AppendFiles.java): 向表中添加新的数据文件
+- [RewriteFiles](mdc:api/src/main/java/org/apache/iceberg/RewriteFiles.java): 重写表中的数据文件
+- [DeleteFiles](mdc:api/src/main/java/org/apache/iceberg/DeleteFiles.java): 从表中删除数据文件
+- [Transaction](mdc:api/src/main/java/org/apache/iceberg/Transaction.java): 支持多个表操作的原子提交
+
+### 表扫描接口
+
+- [TableScan](mdc:api/src/main/java/org/apache/iceberg/TableScan.java): 表扫描基础接口
+- [FilteredScan](mdc:api/src/main/java/org/apache/iceberg/FilteredScan.java): 支持过滤的扫描
+- [BatchScan](mdc:api/src/main/java/org/apache/iceberg/BatchScan.java): 批量扫描接口
+
+## 表达式与过滤
+
+- [Expressions](mdc:api/src/main/java/org/apache/iceberg/expressions/Expressions.java): 用于构建表达式的工厂方法
+- [Expression](mdc:api/src/main/java/org/apache/iceberg/expressions/Expression.java): 表示过滤和条件表达式的接口

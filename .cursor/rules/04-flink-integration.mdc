@@ -1,0 +1,86 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Iceberg 与 Flink 集成
+
+Iceberg为Apache Flink提供了全面的集成支持，允许Flink读取和写入Iceberg表。Iceberg支持多个Flink版本（v1.15、v1.16、v1.17、v1.18）。
+
+## 核心组件
+
+### Flink Catalog
+
+- [FlinkCatalog](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/FlinkCatalog.java): Flink目录的Iceberg实现，用于管理Iceberg表
+- [FlinkCatalogFactory](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/FlinkCatalogFactory.java): 创建FlinkCatalog实例的工厂类
+
+### 表工厂
+
+- [FlinkTableFactory](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/FlinkTableFactory.java): 创建Flink表的工厂类
+- [IcebergTableSource](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/source/IcebergTableSource.java): Iceberg表源的实现
+- [IcebergTableSink](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/sink/IcebergTableSink.java): Iceberg表接收器的实现
+
+### 数据源与接收器
+
+- [FlinkSource](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/source/FlinkSource.java): 从Iceberg表读取数据的Flink数据源
+- [FlinkSink](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkSink.java): 将数据写入Iceberg表的Flink接收器
+
+### 格式转换
+
+- [RowDataToRowConverter](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/data/RowDataToRowConverter.java): 在Flink RowData和Iceberg Row之间转换
+- [FlinkTypeToType](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/FlinkTypeToType.java): 在Flink类型和Iceberg类型之间转换
+
+## 事务支持
+
+- [FlinkTableOperations](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/FlinkTableOperations.java): Flink特定的表操作实现
+- [FlinkUpsertTable](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/FlinkUpsertTable.java): 支持upsert操作的Flink表
+
+## Flink SQL支持
+
+- [FlinkDynamicTableFactory](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/FlinkDynamicTableFactory.java): 支持Flink SQL的动态表工厂
+- [IcebergStreamWriter](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/sink/IcebergStreamWriter.java): 流式写入Iceberg表的写入器
+
+## Flink CDC支持
+
+- [RowDataTaskWriterFactory](mdc:flink/v1.17/flink/src/main/java/org/apache/iceberg/flink/sink/RowDataTaskWriterFactory.java): 处理CDC事件的任务写入器工厂
+
+## 常见使用模式
+
+### 批处理读写
+
+```java
+// 创建Flink表环境
+TableEnvironment tEnv = TableEnvironment.create(settings);
+
+// 注册Iceberg目录
+tEnv.executeSql("CREATE CATALOG iceberg_catalog WITH (" +
+    "'type'='iceberg', " +
+    "'catalog-type'='hive', " +
+    "'uri'='thrift://localhost:9083', " +
+    "'warehouse'='hdfs://localhost:8020/warehouse/path')");
+
+// 读取Iceberg表
+tEnv.executeSql("SELECT * FROM iceberg_catalog.db.table").print();
+
+// 写入Iceberg表
+tEnv.executeSql("INSERT INTO iceberg_catalog.db.table SELECT * FROM source_table");
+```
+
+### 流式处理
+
+```java
+// 创建Flink流表环境
+StreamTableEnvironment tEnv = StreamTableEnvironment.create(env, settings);
+
+// 注册Iceberg目录
+tEnv.executeSql("CREATE CATALOG iceberg_catalog WITH (" +
+    "'type'='iceberg', " +
+    "'catalog-type'='hive', " +
+    "'uri'='thrift://localhost:9083', " +
+    "'warehouse'='hdfs://localhost:8020/warehouse/path')");
+
+// 流式写入Iceberg表
+tEnv.executeSql(
+    "INSERT INTO iceberg_catalog.db.table /*+ OPTIONS('write-mode'='upsert') */ " +
+    "SELECT * FROM kafka_source_table");
+```

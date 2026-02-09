@@ -1,0 +1,152 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Iceberg 代码探索策略
+
+本指南提供了系统化探索和理解Apache Iceberg源代码的方法。作为一位想要深入理解每一行代码的学习者，你可以按照以下策略进行探索。
+
+## 自顶向下的探索方法
+
+### 1. 从接口到实现
+
+Iceberg遵循接口优先的设计模式。学习时应先理解接口定义，再研究实现：
+
+1. 首先阅读 `api` 模块中的接口定义
+2. 然后查看 `core` 模块中的对应实现
+3. 注意实现类通常以 `Base` 开头，如 `BaseTable`、`BaseTransaction` 等
+
+例如，研究表操作时：
+```java
+// 先理解接口定义
+// api/src/main/java/org/apache/iceberg/Table.java
+public interface Table {
+  // 核心方法定义...
+}
+
+// 再研究实现
+// core/src/main/java/org/apache/iceberg/BaseTable.java
+public class BaseTable implements Table {
+  // 实现细节...
+}
+```
+
+### 2. 遵循数据流
+
+数据在Iceberg中的流动路径是理解代码的关键：
+
+1. **写入路径**: 数据 → 文件写入器 → 数据文件 → 清单文件 → 表元数据
+   - 关注: `DataWriter` → `DataFile` → `ManifestWriter` → `TableOperations`
+
+2. **读取路径**: 表元数据 → 清单文件 → 数据文件 → 数据读取器 → 数据
+   - 关注: `TableScan` → `ManifestReader` → `DataReader` → 用户数据
+
+### 3. 跟踪关键对象生命周期
+
+跟踪以下核心对象的创建、使用和销毁过程：
+
+- `TableMetadata`: 表元数据的生命周期
+- `Snapshot`: 快照的创建和演化
+- `ManifestFile`: 清单文件的生成和管理
+- `DataFile`: 数据文件的记录和跟踪
+
+## 重点关注的核心代码路径
+
+### 表操作的核心路径
+
+1. **表创建流程**:
+   ```
+   TableBuilder → Catalog → TableOperations → TableMetadata
+   ```
+
+2. **写入操作流程**:
+   ```
+   AppendFiles → TableOperations → ManifestWriter → DataFile → FileAppender
+   ```
+
+3. **读取操作流程**:
+   ```
+   TableScan → FilteredScan → DataOperations → ManifestReader → DataReader
+   ```
+
+4. **事务处理流程**:
+   ```
+   Transaction → BaseTransaction → CommitTracker → TableOperations
+   ```
+
+### Flink集成核心代码路径
+
+1. **Flink读取流程**:
+   ```
+   FlinkSource → IcebergSource → TableScan → ManifestReader → DataReader
+   ```
+
+2. **Flink写入流程**:
+   ```
+   FlinkSink → IcebergSink → AppendFiles → ManifestWriter → DataWriter
+   ```
+
+### Spark集成核心代码路径
+
+1. **Spark读取流程**:
+   ```
+   SparkTable → SparkBatchScan → TableScan → ManifestReader → DataReader
+   ```
+
+2. **Spark写入流程**:
+   ```
+   SparkBatchWrite → SparkWrite → AppendFiles → ManifestWriter → DataWriter
+   ```
+
+## 分析代码的最佳实践
+
+### 1. 构建调用图
+
+为关键操作绘制调用图，例如：
+
+```
+Table.newAppend()
+  ↓
+BaseTable.newAppend()
+  ↓
+TableOperations.newAppend()
+  ↓
+BaseAppendFiles.commit()
+  ↓
+ManifestWriter.write()
+```
+
+### 2. 分析关键算法
+
+重点研究以下关键算法：
+
+- **清单文件合并算法**: `ManifestMergeManager`
+- **分区裁剪算法**: `PartitionFilter`
+- **元数据提交算法**: `TableOperations.commit()`
+- **乐观并发控制**: `TableOperations.refresh()`
+
+### 3. 理解配置参数
+
+配置参数对代码行为有重要影响，关注：
+
+- 表属性配置: `TableProperties`
+- Catalog配置: `CatalogProperties`
+- 引擎特定配置: `SparkConfigs`, `FlinkConfigs`
+
+## 常见设计模式
+
+Iceberg使用多种设计模式，识别这些模式有助于理解代码：
+
+1. **工厂模式**: 各种工厂类，如 `FileWriterFactory`
+2. **构建器模式**: 各种Builder类，如 `SchemaBuilder`
+3. **策略模式**: 不同的实现策略，如 `DeleteStrategy`
+4. **访问者模式**: 处理表达式，如 `ExpressionVisitor`
+5. **代理模式**: 代理类，如 `ForwardingTable`
+
+## 调试与分析技巧
+
+1. **关注日志输出**: Iceberg使用SLF4J记录关键操作，查看日志有助于理解代码流程
+2. **分析单元测试**: 单元测试展示了各组件的预期行为和使用方式
+3. **跟踪配置参数**: 配置参数影响代码执行路径
+4. **构建本地环境**: 在本地构建Iceberg并运行示例，观察实际执行情况

@@ -1,0 +1,101 @@
+---
+description:
+globs:
+alwaysApply: false
+---
+# Iceberg 与 Spark 集成
+
+Iceberg为Apache Spark提供了深度集成，支持多个Spark版本（v3.3、v3.4、v3.5）。Spark是最常用的Iceberg查询引擎之一。
+
+## 核心组件
+
+### Spark Catalog
+
+- [SparkCatalog](mdc:spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/SparkCatalog.java): Spark目录的Iceberg实现
+- [SparkSessionCatalog](mdc:spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/SparkSessionCatalog.java): Spark会话目录的实现
+
+### 数据源
+
+- [SparkTable](mdc:spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkTable.java): Spark表的Iceberg实现
+- [SparkBatchQueryScan](mdc:spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkBatchQueryScan.java): Spark批量查询扫描
+- [SparkMicroBatchStream](mdc:spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkMicroBatchStream.java): Spark微批流处理支持
+
+### 读写支持
+
+- [SparkBatchWrite](mdc:spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkBatchWrite.java): Spark批量写入支持
+- [SparkMicroBatchWrite](mdc:spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkMicroBatchWrite.java): Spark微批写入支持
+
+### 格式转换
+
+- [SparkTypeToType](mdc:spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/SparkTypeToType.java): 在Spark类型和Iceberg类型之间转换
+- [SparkValueConverter](mdc:spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/data/SparkValueConverter.java): 在Spark值和Iceberg值之间转换
+
+## Spark SQL扩展
+
+- [IcebergSpark](mdc:spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/Spark3Util.java): Spark SQL支持工具
+- [SparkExtensions](mdc:spark/v3.5/spark-extensions/src/main/scala/org/apache/iceberg/spark/extensions/IcebergSparkSessionExtensions.scala): Spark会话扩展，添加Iceberg特定的SQL命令
+
+### 支持的SQL命令
+
+- `ALTER TABLE ... ADD PARTITION FIELD`: 添加分区字段
+- `ALTER TABLE ... DROP PARTITION FIELD`: 删除分区字段
+- `ALTER TABLE ... WRITE ORDERED BY`: 设置排序顺序
+- `CALL system.rollback_to_snapshot`: 回滚到特定快照
+- `CALL system.set_current_snapshot`: 设置当前快照
+- `MERGE INTO`: 支持高效的更新和插入操作
+
+## 时间旅行支持
+
+Iceberg允许Spark查询访问表的历史版本：
+
+```sql
+-- 按时间戳查询
+SELECT * FROM my_table TIMESTAMP AS OF '2023-01-01 12:00:00'
+
+-- 按快照ID查询
+SELECT * FROM my_table VERSION AS OF 123456
+```
+
+## 常见使用模式
+
+### 批处理读写
+
+```scala
+// 读取Iceberg表
+val df = spark.read.format("iceberg").load("catalog.db.table")
+
+// 写入Iceberg表
+df.write
+  .format("iceberg")
+  .mode("append")
+  .save("catalog.db.table")
+```
+
+### 流式处理
+
+```scala
+// 流式读取
+val stream = spark.readStream
+  .format("iceberg")
+  .load("catalog.db.table")
+
+// 流式写入
+df.writeStream
+  .format("iceberg")
+  .outputMode("append")
+  .option("checkpointLocation", "/path/to/checkpoint")
+  .start("catalog.db.table")
+```
+
+### 高级功能
+
+```scala
+// 元数据表查询
+val files = spark.read.format("iceberg").load("catalog.db.table.files")
+val snapshots = spark.read.format("iceberg").load("catalog.db.table.snapshots")
+
+// 谓词下推和分区裁剪
+val filteredDF = spark.read.format("iceberg")
+  .load("catalog.db.table")
+  .filter($"date" > "2023-01-01" && $"id" === 123)
+```
