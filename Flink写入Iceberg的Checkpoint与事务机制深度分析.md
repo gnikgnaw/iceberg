@@ -758,50 +758,59 @@ class TableMetadata {
 Iceberg的原子性保证基于**文件系统的原子操作**：
 
 ```
-元数据文件结构：
+元数据文件结构（以HadoopCatalog为例）：
 table/
   ├── metadata/
-  │   ├── v1.metadata.json      ← 历史版本
-  │   ├── v2.metadata.json      ← 历史版本
-  │   ├── v3.metadata.json      ← 当前版本
-  │   ├── snap-123.avro         ← Snapshot文件
-  │   └── manifest-*.avro       ← Manifest文件
+  │   ├── version-hint.text             ← 版本指针文件（仅HadoopCatalog使用）
+  │   ├── v1.metadata.json              ← 历史版本（HadoopCatalog命名格式）
+  │   ├── v2.metadata.json              ← 历史版本
+  │   ├── v3.metadata.json              ← 当前版本
+  │   ├── snap-123-1-uuid.avro          ← Manifest List文件（snap-{snapshotId}-{attempt}-{commitUUID}.avro）
+  │   └── uuid-m0.avro                  ← Manifest文件（{commitUUID}-m{序号}.avro）
   ├── data/
   │   └── *.parquet
-  └── version-hint.text         ← 指针文件（指向v3.metadata.json）
+  └── version-hint.text                 ← 指针文件（指向v3.metadata.json）
+
+注意：不同Catalog的元数据文件命名格式不同：
+  • HadoopCatalog: v{version}.metadata.json（如 v1.metadata.json）
+    — 通过文件系统rename实现原子提交，version-hint.text辅助定位最新版本
+  • Hive/JDBC/REST Catalog: {00001}-{UUID}.metadata.json（如 00001-a1b2c3d4.metadata.json）
+    — 通过外部元数据存储（Hive Metastore/数据库）记录当前版本指针，不需要version-hint.text
 
 提交流程：
-1. 生成新的v4.metadata.json文件
-2. 原子替换version-hint.text的内容：
-   v3.metadata.json → v4.metadata.json
+1. 生成新的元数据文件（v4.metadata.json 或 00004-{UUID}.metadata.json）
+2. 原子更新版本指针：
+   HadoopCatalog: rename临时文件 + 更新version-hint.text
+   MetastoreCatalog: 更新Hive Metastore/数据库中的metadata_location
 3. 成功 → 提交完成
-   失败 → 版本冲突，抛出异常
+   失败 → 版本冲突，抛出CommitFailedException → 触发重试
 ```
 
-**不同文件系统的实现**：
+**不同Catalog实现的原子提交方式**：
 
 ```java
-// HDFS/本地文件系统：HadoopTableOperations
+// HDFS/本地文件系统：HadoopTableOperations.java:130-172
 public void commit(TableMetadata base, TableMetadata metadata) {
     // 1. 检查base是否为当前版本
     if (base != current()) {
-        throw new CommitFailedException("Cannot commit: stale table metadata");
+        throw new CommitFailedException("Cannot commit changes based on stale table metadata");
     }
 
-    // 2. 写入新的元数据文件
-    String newMetadataLocation = writeNewMetadata(metadata, version + 1);
+    // 2. 写入临时元数据文件
+    Path tempMetadataFile = metadataPath(UUID.randomUUID() + fileExtension);
+    TableMetadataParser.write(metadata, io().newOutputFile(tempMetadataFile.toString()));
 
-    // 3. 原子替换指针文件
-    boolean success = io.rename(
-        tempMetadataFile,
-        metadataFileLocation,
-        overwrite = false  // ← 不覆盖，确保原子性
-    );
+    // 3. 通过rename实现原子提交（如果目标文件已存在则失败）
+    Path finalMetadataFile = metadataFilePath(nextVersion, codec);  // v4.metadata.json
+    renameToFinal(fs, tempMetadataFile, finalMetadataFile, nextVersion);
 
-    if (!success) {
-        throw new CommitFailedException("Metadata file already exists");
-    }
+    // 4. 更新version-hint.text（尽力而为，失败不影响提交）
+    writeVersionHint(nextVersion);
 }
+
+// Hive Metastore：通过Metastore的CAS更新metadata_location
+// JDBC：通过数据库事务的条件更新实现CAS
+// REST：通过REST API的条件请求实现CAS
 ```
 
 **✅ 第三章(1/2)已生成！**
@@ -812,59 +821,54 @@ public void commit(TableMetadata base, TableMetadata metadata) {
 
 #### 3.2.2 SnapshotProducer的提交流程
 
-**源码位置**: `core/src/main/java/org/apache/iceberg/SnapshotProducer.java`
+**源码位置**: `core/src/main/java/org/apache/iceberg/SnapshotProducer.java:457-541`
+
+**核心要点**：`SnapshotProducer.commit()` **内置了自动重试机制**，通过 `Tasks` 框架实现指数退避重试，而非简单的单次提交。
 
 ```java
 abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
 
     @Override
     public void commit() {
-        // ① 构建新的Snapshot
-        Snapshot newSnapshot = apply();
-
-        // ② 获取当前表元数据
-        TableMetadata base = ops.current();
-
-        // ③ 构建新的表元数据
-        TableMetadata.Builder builder = TableMetadata.buildFrom(base);
-        builder.addSnapshot(newSnapshot);  // 添加新Snapshot
-        builder.setCurrentSnapshot(newSnapshot.snapshotId());  // 设置为当前
-        builder.setLastUpdatedMillis(System.currentTimeMillis());
-
-        TableMetadata newMetadata = builder.build();
-
-        // ④ 提交（带重试）
+        AtomicReference<Snapshot> stagedSnapshot = new AtomicReference<>();
         try {
-            ops.commit(base, newMetadata);
-        } catch (CommitFailedException e) {
-            // 版本冲突，清理临时文件
+            // ① 使用Tasks框架实现带重试的提交
+            Tasks.foreach(ops)
+                .retry(base.propertyAsInt(COMMIT_NUM_RETRIES, 4))           // 默认重试4次
+                .exponentialBackoff(100, 60_000, 1_800_000, 2.0)           // 指数退避
+                .onlyRetryOn(CommitFailedException.class)                   // 仅对OCC冲突重试
+                .run(taskOps -> {
+                    // ② 每次重试都基于最新base重新计算Snapshot
+                    Snapshot newSnapshot = apply();
+                    stagedSnapshot.set(newSnapshot);
+
+                    // ③ 构建新的表元数据
+                    TableMetadata updated = TableMetadata.buildFrom(base)
+                        .setBranchSnapshot(newSnapshot, targetBranch)
+                        .build();
+
+                    // ④ 尝试原子提交（失败则抛CommitFailedException触发重试）
+                    taskOps.commit(base, updated.withUUID());
+                });
+
+        } catch (RuntimeException e) {
+            // 重试耗尽后清理临时manifest文件
             cleanAll();
             throw e;
         }
-    }
 
-    protected Snapshot apply() {
-        // 1. 写入Manifest文件
-        List<ManifestFile> manifests = writeManifests();
-
-        // 2. 创建Snapshot对象
-        long snapshotId = ops.newSnapshotId();
-        long sequenceNumber = base.lastSequenceNumber() + 1;
-
-        return new BaseSnapshot(
-            ops,
-            snapshotId,
-            parentSnapshotId,
-            sequenceNumber,
-            System.currentTimeMillis(),
-            operation,  // APPEND / OVERWRITE / DELETE
-            summary,    // 统计信息
-            schemaId,
-            manifestList  // Manifest文件列表
-        );
+        // ⑤ 提交成功后清理未使用的manifest list文件
+        Snapshot committedSnapshot = stagedSnapshot.get();
+        for (String manifestList : manifestLists) {
+            if (!committedSnapshot.manifestListLocation().equals(manifestList)) {
+                deleteFile(manifestList);  // 清理失败尝试产生的文件
+            }
+        }
     }
 }
 ```
+
+**关键设计**：每次重试时 `apply()` 会基于 `refresh()` 后的最新 `base` 重新推导 Snapshot，而非简单重放旧的提交请求。这保证了重试的正确性。
 
 #### 3.2.3 完整的提交流程图
 
@@ -880,7 +884,9 @@ appendFiles.appendFile(dataFile2)
     ↓
 appendFiles.commit()
     ↓
-    ├─ Phase 1: apply() - 构建Snapshot
+    ├─ Tasks.foreach(ops).retry(4).exponentialBackoff(...).run(taskOps -> {
+    │
+    │   ├─ Phase 1: apply() - 构建Snapshot（每次重试都重新执行）
     │   ├─ writeManifests()
     │   │   ├─ 创建ManifestWriter
     │   │   ├─ 写入所有DataFile元数据
@@ -919,24 +925,26 @@ appendFiles.commit()
     │   │       .build()
     │   └─ 返回 newMetadata (version=v4, seq=101)
     │
-    └─ Phase 3: ops.commit(base, newMetadata) - 原子提交
-        ├─ 检查版本冲突
-        │   if (base != current()) {
-        │       throw CommitFailedException("Stale metadata");
-        │   }
+    └─ Phase 3: taskOps.commit(base, newMetadata) - 原子提交
+        ├─ 检查版本冲突（由具体TableOperations实现）
+        │   HadoopTableOperations: 通过rename原子性检测
+        │   BaseMetastoreTableOperations: 通过Metastore CAS检测
         │
         ├─ 写入新元数据文件
         │   writeNewMetadata(newMetadata, 4)
-        │   → s3://bucket/db/table/metadata/v4.metadata.json
+        │   → s3://bucket/db/table/metadata/00004-{uuid}.metadata.json
         │
         ├─ 原子替换指针
         │   【关键操作】
-        │   HDFS: rename(temp, target, overwrite=false)
-        │   S3:   putObject(key, data, ifNoneMatch="*")
+        │   HDFS: rename(temp, target) + writeVersionHint
+        │   HiveMetastore: ALTER TABLE SET LOCATION
+        │   JDBC: UPDATE ... WHERE metadata_location = base_location
         │
         └─ 成功 / 失败
             成功 → Snapshot 1001 对读取可见
-            失败 → CommitFailedException
+            失败 → CommitFailedException → 触发Tasks框架重试
+    │
+    └─ }) // Tasks重试循环结束
 ```
 
 ### 3.3 Snapshot的版本链
@@ -1163,21 +1171,41 @@ snapshotId = 1000               snapshotId = 1001
 
 #### 3.5.3 提交失败的处理
 
-```java
-// Flink侧处理
-try {
-    appendFiles.commit();
-} catch (CommitFailedException e) {
-    // ❌ 不自动重试（由Flink的checkpoint机制重试）
-    // ❌ 不清理DataFile（可能下次重试会用到）
-    // ✅ 抛出异常，触发Flink作业失败
-    throw new IOException("Failed to commit to Iceberg", e);
-}
+**两层容错机制**：
 
-// 重启后恢复：
-// 1. Flink从最近的成功checkpoint恢复
-// 2. IcebergFilesCommitter从State恢复未提交的文件列表
-// 3. 下次checkpoint时重新提交
+```
+第一层（Iceberg Core自动重试）：
+  SnapshotProducer.commit() 内置了 Tasks 重试框架
+  ├── 默认重试4次，指数退避（100ms → 60s）
+  ├── 每次重试：refresh() 获取最新 base → apply() 重新计算 → commit()
+  ├── 仅对 CommitFailedException（OCC冲突）重试
+  └── 重试耗尽 → 抛出异常到 Flink 层
+
+第二层（Flink框架容错）：
+  SinkV2 (IcebergCommitter):
+  ├── Flink框架的 Committer 重试机制自动重试
+  └── 多次失败后触发作业 failover
+
+  旧版 (IcebergFilesCommitter):
+  ├── 异常传播到 notifyCheckpointComplete()
+  ├── 触发 Flink 作业 failover 重启
+  └── 从 checkpoint State 恢复未提交文件列表
+```
+
+**Flink侧的提交代码**（`IcebergCommitter.java:298` / `IcebergFilesCommitter.java:396`）：
+
+```java
+// Flink侧直接调用 operation.commit()，不额外包装重试
+// 因为 SnapshotProducer.commit() 内部已有完整的重试机制
+operation.commit(); // abort is automatically called if this fails.
+```
+
+**重启后恢复**：
+```
+1. Flink从最近的成功checkpoint恢复
+2. IcebergFilesCommitter从State中恢复未提交的文件列表
+3. 从Iceberg表Snapshot的summary中读取maxCommittedCheckpointId
+4. 跳过已提交的checkpoint，继续提交未完成的
 ```
 
 **孤儿文件清理**：
@@ -1238,10 +1266,10 @@ T7: Job B提交 commit(v3, v4') → 失败！CommitFailedException
   → 重新提交：commit(v4, v5) → 成功！
 ```
 
-#### 4.1.2 分区级别隔离
+#### 4.1.2 Append操作的并发安全性
 
 ```
-场景2：不同分区的并发写入（无冲突）
+场景2：不同分区的并发Append写入（无冲突）
 
 Job A写入：year=2024, month=01
 Job B写入：year=2024, month=02
@@ -1249,135 +1277,179 @@ Job B写入：year=2024, month=02
 时间轴：
 T0: 两个Job都读取元数据 v3
 T1: Job A提交 → v4 (添加month=01的文件)
-T2: Job B提交 → 使用v3作为base
-    ↓ 检查发现v4与v3的差异在month=01
-    ↓ 而Job B修改的是month=02，无冲突
-    ↓ 自动合并：v5 = v4 + Job B的修改
+T2: Job B提交 → base=v3, 但current已经是v4
+    ↓ SnapshotProducer.commit() 内部检测到 CommitFailedException
+    ↓ Tasks框架自动重试：refresh() → base=v4
+    ↓ 基于v4重新apply()：追加month=02的文件
+    ↓ 提交 commit(v4, v5) → 成功！
 
 结果：
   ✅ 两个Job都成功提交
-  ✅ 分区级别的隔离避免了不必要的冲突
+  ✅ Append操作对已有数据不敏感，重试几乎总是成功
+  ✅ 这个过程对Flink层完全透明（由Iceberg Core自动处理）
 ```
 
 ### 4.2 CommitFailedException的触发条件
 
-**源码位置**: `core/src/main/java/org/apache/iceberg/BaseTableOperations.java`
+**实际的冲突检测发生在 `SnapshotProducer.commit()` 内部的重试循环中**。当 `taskOps.commit(base, updated)` 调用到具体的 `TableOperations` 实现时，会检测版本冲突。
+
+**不同Catalog实现的冲突检测方式**：
 
 ```java
+// HadoopTableOperations — 通过文件系统rename的原子性检测冲突
 public void commit(TableMetadata base, TableMetadata metadata) {
-    // ① 检查base是否为当前版本
-    TableMetadata current = refresh();  // 刷新最新元数据
-    
-    if (base != current) {
-        // 版本不匹配，分析冲突类型
-        if (canResolveConflict(base, current, metadata)) {
-            // 可自动解决的冲突，重新构建
-            metadata = resolveConflict(base, current, metadata);
-            base = current;
-        } else {
-            // 无法自动解决，抛出异常
-            throw new CommitFailedException(
-                "Cannot commit: stale table metadata for %s", 
-                tableName
-            );
-        }
+    if (base != current()) {
+        throw new CommitFailedException("Cannot commit changes based on stale table metadata");
     }
+    // 写入临时文件后，通过rename到目标路径
+    // 如果目标文件已存在（另一个writer先提交了），rename失败 → CommitFailedException
+    renameToFinal(fs, tempMetadataFile, finalMetadataFile, nextVersion);
+}
 
-    // ② 执行原子提交
-    doCommit(base, metadata);
+// BaseMetastoreTableOperations（Hive/JDBC等）— 通过外部存储的CAS检测冲突
+public void commit(TableMetadata base, TableMetadata metadata) {
+    // 写入新的metadata文件
+    String newMetadataLocation = writeNewMetadata(metadata, currentVersion() + 1);
+    // 通过Metastore的CAS操作更新metadata_location
+    // 如果当前location不是base的location → CommitFailedException
 }
 ```
+
+**在 `SnapshotProducer` 的 `Tasks` 重试循环中**：
+- `CommitFailedException` → 触发重试（刷新base，重新apply，再次commit）
+- 其他异常（如 `ValidationException`）→ 不重试，直接抛出
 
 **触发条件**：
 
 | 场景 | base | current | 结果 |
 |------|------|---------|------|
-| 无冲突 | v3 | v3 | ✅ 直接提交 |
-| 分区隔离 | v3 | v4 | ✅ 自动合并 |
-| Schema冲突 | v3 | v4 | ❌ CommitFailedException |
-| 同分区冲突 | v3 | v4 | ❌ CommitFailedException |
-| 覆盖冲突 | v3 | v4 | ❌ CommitFailedException |
+| 无冲突 | v3 | v3 | 直接提交成功 |
+| Append+Append（不同分区） | v3 | v4 | 重试时基于v4重新apply，通常成功 |
+| Append+Append（同分区） | v3 | v4 | 重试时基于v4重新apply，通常成功（Append对已有数据不敏感） |
+| Schema冲突 | v3 | v4 | ValidationException，不重试 |
+| OverwritePartition冲突 | v3 | v4 | 需要验证被覆盖分区未被修改，可能失败 |
 
 ### 4.3 冲突解决策略
 
 #### 4.3.1 自动重试机制
 
-```java
-// Iceberg内部没有自动重试，由调用方实现
-// Flink的处理方式：
+**重要**：Iceberg Core **内置了自动重试机制**，由 `SnapshotProducer.commit()` 通过 `Tasks` 框架实现，Flink 侧**不需要额外编写重试逻辑**。
 
-public void commitWithRetry(SnapshotUpdate<?> operation) {
-    int maxRetries = 3;
-    int retryCount = 0;
-    
-    while (retryCount < maxRetries) {
+**源码位置**: `core/src/main/java/org/apache/iceberg/SnapshotProducer.java:457-500`
+
+```java
+@Override
+public void commit() {
+    AtomicReference<Snapshot> stagedSnapshot = new AtomicReference<>();
+    try {
+        // Iceberg内置的重试框架
+        Tasks.foreach(ops)
+            .retry(base.propertyAsInt(COMMIT_NUM_RETRIES, COMMIT_NUM_RETRIES_DEFAULT))  // 默认4次
+            .exponentialBackoff(
+                base.propertyAsInt(COMMIT_MIN_RETRY_WAIT_MS, COMMIT_MIN_RETRY_WAIT_MS_DEFAULT),   // 100ms
+                base.propertyAsInt(COMMIT_MAX_RETRY_WAIT_MS, COMMIT_MAX_RETRY_WAIT_MS_DEFAULT),   // 60s
+                base.propertyAsInt(COMMIT_TOTAL_RETRY_TIME_MS, COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT), // 30min
+                2.0 /* exponential */)
+            .onlyRetryOn(CommitFailedException.class)  // 仅对OCC冲突重试
+            .run(taskOps -> {
+                Snapshot newSnapshot = apply();         // 基于最新base重新计算Snapshot
+                stagedSnapshot.set(newSnapshot);
+                TableMetadata updated = TableMetadata.buildFrom(base)
+                    .setBranchSnapshot(newSnapshot, targetBranch)
+                    .build();
+                taskOps.commit(base, updated.withUUID()); // 尝试原子提交
+            });
+    } catch (RuntimeException e) {
+        // 重试耗尽后清理临时文件
+        cleanAll();
+        throw e;
+    }
+}
+```
+
+**真正的重试引擎**：`core/src/main/java/org/apache/iceberg/util/Tasks.java:403-470`
+
+```java
+private <E extends Exception> void runTaskWithRetry(Task<I, E> task, I item) throws E {
+    long start = System.currentTimeMillis();
+    int attempt = 0;
+    while (true) {
+        attempt += 1;
         try {
-            operation.commit();
-            return;  // 成功
-        } catch (CommitFailedException e) {
-            retryCount++;
-            if (retryCount >= maxRetries) {
-                throw e;  // 重试次数耗尽
+            task.run(item);
+            break;  // 成功则退出
+        } catch (Exception e) {
+            long durationMs = System.currentTimeMillis() - start;
+            // 超过最大重试次数 或 超过总超时时间 → 抛出异常
+            if (attempt >= maxAttempts || (durationMs > maxDurationMs && attempt > 1)) {
+                throw e;
             }
-            
-            // 等待一段时间后重试
-            Thread.sleep(1000 * retryCount);  // 指数退避
-            
-            // 刷新表元数据
-            table = tableLoader.loadTable();
+            // 仅对 CommitFailedException 重试（由 onlyRetryOn 指定）
+            // ...异常类型检查...
+
+            // 指数退避 + 10%随机抖动
+            int delayMs = (int) Math.min(
+                minSleepTimeMs * Math.pow(scaleFactor, attempt - 1),
+                (double) maxSleepTimeMs);
+            int jitter = ThreadLocalRandom.current().nextInt(Math.max(1, (int)(delayMs * 0.1)));
+            TimeUnit.MILLISECONDS.sleep(delayMs + jitter);
         }
     }
 }
 ```
 
-#### 4.3.2 分区级别的冲突检测
+**默认重试参数**（`TableProperties.java:86-96`）：
 
-```java
-// AppendFiles的冲突检测
-public class FastAppend extends SnapshotProducer<AppendFiles> {
-    
-    @Override
-    protected void validate(TableMetadata base, TableMetadata current) {
-        // 检查是否有Schema变更
-        if (base.schema().schemaId() != current.schema().schemaId()) {
-            throw new ValidationException(
-                "Schema changed between base and current"
-            );
-        }
-        
-        // 检查是否有分区规范变更
-        if (base.spec().specId() != current.spec().specId()) {
-            throw new ValidationException(
-                "Partition spec changed"
-            );
-        }
-        
-        // Append操作对分区内容不敏感，只要Schema/Spec不变就可以提交
-    }
-}
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `commit.retry.num-retries` | 4 | 最大重试次数 |
+| `commit.retry.min-wait-ms` | 100ms | 最小退避等待 |
+| `commit.retry.max-wait-ms` | 60,000ms (1分钟) | 最大退避等待 |
+| `commit.retry.total-timeout-ms` | 1,800,000ms (30分钟) | 总超时时间 |
 
-// ReplacePartitions的冲突检测
-public class ReplacePartitions extends SnapshotProducer<ReplacePartitions> {
-    
-    @Override
-    protected void validate(TableMetadata base, TableMetadata current) {
-        // 获取要覆盖的分区
-        Set<StructLike> replacedPartitions = getReplacedPartitions();
-        
-        // 检查这些分区在base到current期间是否被修改
-        for (Snapshot snap : getSnapshotsBetween(base, current)) {
-            Set<StructLike> modifiedPartitions = getModifiedPartitions(snap);
-            
-            // 如果有交集，说明冲突
-            if (hasIntersection(replacedPartitions, modifiedPartitions)) {
-                throw new ValidationException(
-                    "Partition %s was modified by another transaction",
-                    modifiedPartitions
-                );
-            }
-        }
-    }
-}
+**两层重试架构**：
+
+```
+第一层: Iceberg Core (SnapshotProducer)
+  ├── 重试 4 次，指数退避 + 随机抖动
+  ├── 处理: OCC 并发冲突（毫秒到秒级）
+  └── 失败后抛出 CommitFailedException
+          ↓
+第二层: Flink 框架
+  ├── SinkV2 (IcebergCommitter): Flink Committer 重试机制
+  └── 旧版 (IcebergFilesCommitter): 作业 failover → 从 checkpoint 恢复 → 重新提交
+```
+
+#### 4.3.2 不同操作类型的冲突敏感度
+
+**关键理解**：Iceberg 的冲突检测不是在提交时做"自动合并"，而是在 `SnapshotProducer` 的重试循环中，每次重试都基于 `refresh()` 后的最新 `base` 重新执行 `apply()`。不同操作类型对并发修改的敏感度不同：
+
+```
+AppendFiles (FastAppend):
+  └─ 冲突敏感度: 最低
+     • 只添加新文件，不删除也不覆盖
+     • 即使base过期，重试时基于新base重新append即可
+     • 多个并发Append几乎不会冲突
+     • Flink流式写入主要使用此操作
+
+RowDelta:
+  └─ 冲突敏感度: 中等
+     • 添加数据文件 + 删除文件
+     • equality-delete 应用于所有历史sequence number，重试安全
+     • position-delete 只删除同次提交的数据文件，无并发风险
+     • Flink CDC场景使用此操作
+
+ReplacePartitions:
+  └─ 冲突敏感度: 较高
+     • 覆盖指定分区的所有数据
+     • 如果目标分区在base到current之间被修改过，可能需要冲突检测
+     • Flink的overwrite模式使用此操作
+
+OverwriteFiles:
+  └─ 冲突敏感度: 最高
+     • 删除满足条件的文件 + 添加新文件
+     • 需要验证被删除的文件未被并发修改
+     • 通常需要 conflictDetectionFilter 进行分区级别隔离
 ```
 
 ### 4.4 并发场景实战分析
@@ -1394,17 +1466,20 @@ public class ReplacePartitions extends SnapshotProducer<ReplacePartitions> {
 T0: 三个Job同时启动，读取v10
 T1: Job A完成checkpoint，提交 → v11 (month=01)
 T2: Job B完成checkpoint，提交
-    ↓ base=v10, current=v11
-    ↓ 检查：v11新增的是month=01，Job B修改的是month=02
-    ↓ 无冲突，自动合并 → v12
+    ↓ base=v10, current=v11 → CommitFailedException
+    ↓ Tasks自动重试：refresh() → base=v11
+    ↓ 重新apply()：基于v11追加month=02的文件
+    ↓ commit(v11, v12) → 成功！ → v12
 T3: Job C完成checkpoint，提交
-    ↓ base=v10, current=v12
-    ↓ 检查：v12新增的是month=01和02，Job C修改的是month=03
-    ↓ 无冲突，自动合并 → v13
+    ↓ base=v10, current=v12 → CommitFailedException
+    ↓ Tasks自动重试：refresh() → base=v12
+    ↓ 重新apply()：基于v12追加month=03的文件
+    ↓ commit(v12, v13) → 成功！ → v13
 
 结果：
-  ✅ 三个Job都成功
+  ✅ 三个Job都成功（通过Iceberg Core的自动重试）
   ✅ 最终v13包含所有三个月的数据
+  ✅ Append操作重试成本很低，因为只是重新添加文件引用
 ```
 
 #### 4.4.2 场景2：同时覆盖同一分区（冲突）
@@ -1670,7 +1745,7 @@ Checkpoint失败后，DataFile会成为**孤儿文件（Orphan Files）**：
 | **版本标识** | 元数据文件路径+序列号 | 记录的version字段 |
 | **冲突粒度** | 表级别/分区级别 | 行级别 |
 | **原子操作** | 文件系统原子操作 | 数据库事务 |
-| **重试机制** | 调用方手动重试 | 通常框架自动重试 |
+| **重试机制** | SnapshotProducer内置自动重试（Tasks框架，默认4次指数退避） | 通常框架自动重试 |
 | **读隔离** | Snapshot隔离 | 取决于隔离级别 |
 | **性能** | 适合批量写入 | 适合小事务 |
 
