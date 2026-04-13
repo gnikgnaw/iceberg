@@ -36,6 +36,10 @@
 - [小文件优化(Compaction)是否会优化删除文件？如何优化？](#q-3-9) 🟠
 - [Iceberg 打 Tag 时与快照的关系是什么？Tag 的底层实现机制是什么？](#q-3-10) 🟡
 - [小文件合并(Compaction)重写了新文件,历史文件会删除吗？在什么时候删除？](#q-3-11) 🟠
+- [全新启动的 Flink 作业写 Iceberg，checkpoint 从 1 开始，会被 Iceberg 中已有的 maxCheckpointId 拦截吗？](#q-3-12) 🟠
+- [Flink 的 JobID 是如何生成的？为什么全新启动和恢复启动不会冲突？](#q-3-13) 🟡
+- [Flink 写入 Iceberg 时 `insertedRowMap` 会定时清空吗？它的生命周期是什么？](#q-3-14) 🟠
+- [Flink CDC upsert 模式下的删除一定是 Equality Delete 文件吗？`ConvertEqualityDeleteFiles` 能否将其转换？](#q-3-15) 🔴
 
 ### 四、文件管理与优化
 - [对比分析 `RewriteDataFiles` 的 BinPack、Sort 和 Z-Order 策略。](#q-4-1) 🟠
@@ -48,6 +52,7 @@
 - [解释 Iceberg 如何利用元数据进行 Filter Pushdown。](#q-5-2) 🟡
 - [Iceberg 如何实现时间旅行查询？](#q-5-3) 🟢
 - [对比 Spark 和 Flink 读取 Iceberg 的实现差异。](#q-5-4) 🟠
+- [Iceberg 元数据的列统计指标存储在哪一层？每层分别记录什么？如何控制统计收集？](#q-5-5) 🟡
 
 ### 六、Spark 与 Flink 读取机制深度解析
 - [请从源码角度说明 `FileScanTask` 如何封装 DataFile 与 DeleteFile 的关联关系？](#q-6-1) 🟡
@@ -94,6 +99,24 @@
 - [为什么有些查询 manifest 规划时会“多读统计列”？](#q-11-10) 🟠
 - [Spark Join 产生的 runtime filter 如何影响 Iceberg 扫描任务？](#q-11-11) 🟡
 - [V2 与 V3+ 在 position delete 介质上的硬约束是什么？](#q-11-12) 🔴
+
+### 十二、Iceberg 元数据结构体系深度解析
+- [元数据整体架构 — 多级索引树](#12-1) 🟢
+- [TableMetadata — 元数据根节点（完整字段、常量、版本约束）](#12-2) 🟡
+- [Schema — 表结构定义（NestedField、V3 新增类型）](#12-3) 🟢
+- [PartitionSpec — 分区规范（Transform 类型、ID 空间隔离）](#12-4) 🟢
+- [SortOrder — 排序规范](#12-5) 🟢
+- [Snapshot — 快照（操作类型、summary 统计、惰性加载）](#12-6) 🟡
+- [SnapshotRef — 快照引用（BRANCH / TAG / 保留策略）](#12-7) 🟡
+- [ManifestFile — 清单文件元数据（Avro Field ID、PartitionFieldSummary 第一层剪枝）](#12-8) 🟠
+- [ManifestEntry — 清单条目（data sequence number vs file sequence number）](#12-9) 🟠
+- [ContentFile / DataFile / DeleteFile — 数据文件元数据（统计信息详解、第二层剪枝）](#12-10) 🟠
+- [StatisticsFile 与 PartitionStatisticsFile — Puffin 格式统计](#12-11) 🟡
+- [版本差异对比矩阵 (V1/V2/V3/V4)](#12-12) 🟡
+- [元数据在读写场景中的作用（写入流程、查询多层剪枝、Compaction）](#12-13) 🟠
+- [完整 TableMetadata JSON 示例 (V2 + V3 差异)](#12-14) 🟡
+- [五大用户特性的元数据架构实现原理（Schema Evolution / Hidden Partitioning / Partition Evolution / Time Travel / Version Rollback）](#12-15) 🔴
+- [元数据层级关系总图](#12-16) 🟡
 
 ---
 ## 一、Schema 演进与元数据管理
@@ -3039,27 +3062,27 @@ public void deleteKey(T key) throws IOException {
 
 **手动转换场景**:
 
-Iceberg 提供了 `ConvertEqualityDeleteFiles` Action:
+Iceberg 定义了 `ConvertEqualityDeleteFiles` Action 接口，**但截至当前版本（1.x）尚无任何引擎实现**:
 
 ```java
 // 源码: api/src/main/java/org/apache/iceberg/actions/ConvertEqualityDeleteFiles.java
 /** An action for converting the equality delete files to position delete files. */
 public interface ConvertEqualityDeleteFiles
     extends SnapshotUpdate<ConvertEqualityDeleteFiles, ConvertEqualityDeleteFiles.Result> {
-
     ConvertEqualityDeleteFiles filter(Expression expression);
-
     interface Result {
         int convertedEqualityDeleteFilesCount();
         int addedPositionDeleteFilesCount();
     }
 }
+// ⚠️ 注意: ActionsProvider 中未注册此方法，SparkActions/FlinkActions 中均无实现类
+// 全仓库搜索 "implements ConvertEqualityDeleteFiles" 返回 0 结果
 ```
 
-**转换方向**:
+**转换方向（理论上）**:
 ```
-Equality Delete -> Position Delete (可以)
-条件:
+Equality Delete -> Position Delete (理论可行，但当前无现成实现)
+原理:
 1. 通过扫描数据文件，根据 equality fields 定位到具体行号
 2. 生成新的 Position Delete 文件
 3. 原子性替换旧的 Equality Delete 文件
@@ -3068,13 +3091,13 @@ Position Delete -> Equality Delete (不可能)
 原因: Position Delete 不包含列值,无法反向推导
 ```
 
-**深入理解**: Equality Delete 转 Position Delete 是一种优化手段,通过扫描数据文件定位行号,将灵活但低效的 Equality Delete 转换为高效的 Position Delete。但这需要额外的扫描成本,只有在 Equality Delete 文件过多影响查询性能时才值得执行。
+**当前可行的替代方案**: 使用 `rewriteDataFiles` 重写数据文件时会自动 apply equality delete，重写后的数据文件不再需要旧的 eq-delete 文件，后续通过 `expireSnapshots` + `deleteOrphanFiles` 清理。
 
 #### 30 秒速记
 
 - 结论先行：Position Delete 来自批次内优化（insertedRowMap），Equality Delete 来自跨批次历史删除
 - 关键方法：`internalPosDelete()` 是分流的核心 -- 优先 Position Delete，失败才 Equality Delete
-- 转换：`ConvertEqualityDeleteFiles` Action 可将 Equality Delete 转为 Position Delete
+- 转换：`ConvertEqualityDeleteFiles` 接口已定义但**未实现**，实际通过 `rewriteDataFiles` 间接消除 Equality Delete
 
 ---
 <a id="q-3-9"></a>
@@ -3129,16 +3152,45 @@ public interface RewritePositionDeleteFiles
 }
 ```
 
-**合并策略**:
+Spark 实现类: `RewritePositionDeleteFilesSparkAction`，使用 `BinPackRewritePositionDeletePlanner` 进行分组规划，`SparkRewritePositionDeleteRunner` 执行实际重写。
 
-`RewritePositionDeleteFiles` 是一个 Action 接口，具体实现由引擎（如 Spark）提供。其核心思路是:
+**合并策略（源码验证后的完整 5 步流程）**:
+
+`SparkRewritePositionDeleteRunner` 是实际执行重写的核心类，其 `doRewrite()` 方法（`SparkRewritePositionDeleteRunner.java:96-127`）揭示了完整流程：
 
 ```
-1. 扫描表中的 Position Delete 文件
-2. 将多个小的 Position Delete 文件读取并合并
-3. 写入新的、更大的 Position Delete 文件
-4. 通过 RewriteFiles 操作原子性地替换旧文件
+1. 扫描表中的 Position Delete 文件，按分区分组（BinPackRewritePositionDeletePlanner）
+2. 将同一分区内的多个小 Position Delete 文件读取
+3. ⭐ 与 DATA_FILES 元数据表做 leftsemi join，过滤掉指向已不存在数据文件的无效删除记录
+4. 按 (file_path, pos) 排序后写入新的、更大的 Position Delete 文件
+5. 通过 RewriteFiles 操作原子性地替换旧文件
 ```
+
+**步骤 3 是文档中容易遗漏的关键点**。源码证据：
+
+```java
+// 源码: SparkRewritePositionDeleteRunner.java:113-116
+// keep only valid position deletes
+Dataset<Row> dataFiles = dataFiles(partitionType, partition);
+Column joinCond = posDeletes.col("file_path").equalTo(dataFiles.col("file_path"));
+Dataset<Row> validDeletes = posDeletes.join(dataFiles, joinCond, "leftsemi");
+```
+
+这意味着 `RewritePositionDeleteFiles` 不仅仅是"合并小文件"，还会**清理过时的删除记录**——那些指向已被 compaction 或 rewrite 删除的数据文件的 position delete 条目会被自动丢弃。
+
+**v3 Deletion Vector（DV）升级能力**:
+
+对于 format-version 3 的表，此 Action 还承担将 v2 Position Delete 文件重写为 v3 Deletion Vector（Puffin 格式）的职责：
+
+```java
+// 源码: RewritePositionDeleteFilesSparkAction.java:122-125
+if (TableUtil.formatVersion(table) >= 3 && !requiresRewriteToDVs()) {
+    LOG.info("v2 deletes in {} have already been rewritten to v3 DVs", table.name());
+    return EMPTY_RESULT;
+}
+```
+
+`requiresRewriteToDVs()` 检查是否还有非 Puffin 格式的 position delete 文件。如果所有 delete 都已经是 DV 格式，则直接返回空结果。
 
 **使用方式**:
 
@@ -3147,14 +3199,25 @@ public interface RewritePositionDeleteFiles
 SparkActions.get()
     .rewritePositionDeletes(table)
     .filter(Expressions.greaterThan("date", "2024-01-01"))
-    .option("target-file-size-bytes", "134217728")  // 128MB
+    .option("target-file-size-bytes", "134217728")  // 128MB，控制合并后的 delete 文件大小
     .execute();
 ```
 
+可用的 option 参数（来自 `SizeBasedFileRewritePlanner`）：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `target-file-size-bytes` | 继承 `write.delete.target-file-size-bytes` | 合并后的目标 delete 文件大小 |
+| `min-file-size-bytes` | target × 0.75 | 小于此值的文件被视为需要合并 |
+| `max-file-size-bytes` | target × 1.80 | 大于此值的文件被视为需要拆分 |
+| `min-input-files` | 5 | 一个分组内最少文件数才触发合并 |
+
 **关键设计**:
 - **分区级别合并**: 同一分区内的 Position Delete 文件合并在一起
-- **排序优化**: 合并后的文件按 `(file_path, pos)` 排序,读取时可以高效查找
-- **大小控制**: 避免生成过大的删除文件
+- **排序优化**: 合并后的文件按 `(file_path, pos)` 排序（`SparkRewritePositionDeleteRunner.java:120`），读取时可高效二分查找
+- **无效删除清理**: leftsemi join 过滤指向已不存在数据文件的 position delete 条目
+- **v3 DV 升级**: format-version 3 的表会将 v2 position delete 重写为 Deletion Vector
+- **大小控制**: 通过 `target-file-size-bytes` 控制输出文件大小，避免生成过大的删除文件
 
 #### Equality Delete 文件优化
 
@@ -3169,16 +3232,19 @@ Equality Delete 文件 B: {user_id: 2, user_id: 3}
 问题: user_id=2 重复,但无法去重(可能是不同时间的删除)
 ```
 
-**解决方案**: 使用 `ConvertEqualityDeleteFiles` Action 将 Equality Delete 转换为 Position Delete
+**解决方案**: `ConvertEqualityDeleteFiles` 接口已定义但**尚无引擎实现**。当前最有效的方式是通过 `RewriteDataFiles` 重写数据文件，重写过程中会自动 apply equality delete，之后通过 `ExpireSnapshots` + `DeleteOrphanFiles` 清理旧的 eq-delete 文件。
 
 ```java
-// ConvertEqualityDeleteFiles Action
-// 1. 扫描数据文件,根据 equality fields 定位对应的行号
-// 2. 生成 Position Delete 文件
-// 3. 原子性替换旧的 Equality Delete 文件
+// 当前可行方案: 通过 RewriteDataFiles 间接消除 Equality Delete
+// 1. rewriteDataFiles 读取数据时自动 apply equality delete
+// 2. 重写后的数据文件已经是"干净"的，不再需要旧的 eq-delete
+// 3. expireSnapshots + deleteOrphanFiles 清理旧文件
+SparkActions.get(spark).rewriteDataFiles(table).execute();
+SparkActions.get(spark).expireSnapshots(table).execute();
+SparkActions.get(spark).deleteOrphanFiles(table).execute();
 ```
 
-也可以通过 `RewriteFiles` 手动转换:
+也可以通过 `RewriteFiles` 手动转换（需要自行实现扫描逻辑）:
 
 ```java
 // 源码: core/src/main/java/org/apache/iceberg/BaseRewriteFiles.java
@@ -3206,13 +3272,13 @@ write.delete.min-file-count-to-compact=5
 write.delete.max-file-count=100
 ```
 
-**深入理解**: 删除文件的小文件优化与数据文件优化同样重要。在 CDC 场景下,删除文件的累积速度可能比数据文件更快,必须定期执行 `RewritePositionDeleteFiles` 或 `ConvertEqualityDeleteFiles` Action 以保持查询性能。
+**深入理解**: 删除文件的小文件优化与数据文件优化同样重要。在 CDC 场景下,删除文件的累积速度可能比数据文件更快,必须定期执行 `RewritePositionDeleteFiles` 合并 Position Delete 小文件,以及通过 `RewriteDataFiles` 间接消除 Equality Delete（`ConvertEqualityDeleteFiles` 接口已定义但尚未实现）。
 
 #### 30 秒速记
 
-- 结论先行：Iceberg 提供 `RewritePositionDeleteFiles` 和 `ConvertEqualityDeleteFiles` 两个 Action
+- 结论先行：Iceberg 提供 `RewritePositionDeleteFiles` 合并 Position Delete；Equality Delete 通过 `RewriteDataFiles` 间接消除
 - Position Delete 优化：合并小文件，按 (file_path, pos) 排序
-- Equality Delete 优化：转换为 Position Delete（通过扫描数据文件定位行号）
+- Equality Delete 优化：`ConvertEqualityDeleteFiles` 接口未实现，当前通过重写数据文件间接消除
 
 ---
 <a id="q-3-10"></a>
@@ -3642,6 +3708,364 @@ DataStream<RowData>
 - 幂等性通过 `SinkUtil.getMaxCommittedCheckpointId()` 保证，与传统 API 共享同一机制
 
 两套 API 的 Iceberg 提交逻辑（`commitDeltaTxn`、`replacePartitions`、`commitOperation` 等）几乎完全一致。
+
+---
+<a id="q-3-12"></a>
+### 3.12 全新启动 Flink 作业的 checkpointId 会被拦截吗
+
+**🟠 问题: 全新启动的 Flink 作业写 Iceberg，checkpoint 从 1 开始，而 Iceberg 中已有其他作业写入的 maxCheckpointId 可能是 1000+。新作业的提交会被跳过吗？**
+
+**答案:**
+
+**不会。** checkpointId 的过滤是按 `(flink.job-id, flink.operator-id)` 绑定的，不是全局的。
+
+#### 核心源码: `SinkUtil.getMaxCommittedCheckpointId()`
+
+`SinkUtil.java:83-105`:
+```java
+static long getMaxCommittedCheckpointId(
+    Table table, String flinkJobId, String operatorId, String branch) {
+  Snapshot snapshot = table.snapshot(branch);
+  long lastCommittedCheckpointId = INITIAL_CHECKPOINT_ID; // -1
+
+  while (snapshot != null) {
+    Map<String, String> summary = snapshot.summary();
+    String snapshotFlinkJobId = summary.get(FLINK_JOB_ID);
+    String snapshotOperatorId = summary.get(OPERATOR_ID);
+    // ★ 关键：必须 jobId 和 operatorId 都匹配才会读取 checkpointId
+    if (flinkJobId.equals(snapshotFlinkJobId)
+        && (snapshotOperatorId == null || snapshotOperatorId.equals(operatorId))) {
+      String value = summary.get(MAX_COMMITTED_CHECKPOINT_ID);
+      if (value != null) {
+        lastCommittedCheckpointId = Long.parseLong(value);
+        break;
+      }
+    }
+    Long parentSnapshotId = snapshot.parentId();
+    snapshot = parentSnapshotId != null ? table.snapshot(parentSnapshotId) : null;
+  }
+
+  return lastCommittedCheckpointId;
+}
+```
+
+#### 每次 Iceberg commit 写入的 snapshot summary
+
+`IcebergCommitter.commitOperation()` (IcebergCommitter.java:292-294):
+```java
+operation.set(SinkUtil.MAX_COMMITTED_CHECKPOINT_ID, Long.toString(checkpointId));
+operation.set(SinkUtil.FLINK_JOB_ID, newFlinkJobId);
+operation.set(SinkUtil.OPERATOR_ID, operatorId);
+```
+
+每个 snapshot 都绑定了产生它的 `(jobId, operatorId, checkpointId)` 三元组。
+
+#### 两种场景对比
+
+| 场景 | jobId | getMaxCommittedCheckpointId 返回值 | 结果 |
+|------|-------|-----------------------------------|------|
+| **全新启动** | 全新 UUID，Iceberg 中没有匹配的 snapshot | `-1` (INITIAL_CHECKPOINT_ID) | 所有 checkpoint 正常提交 |
+| **从 checkpoint/savepoint 恢复** | 新 UUID，但从 state 恢复旧 jobId，用旧 jobId 查询 | 旧作业已提交的最大 checkpointId | 跳过已提交的，只提交剩余的 |
+
+#### 全新启动的完整流程
+
+1. Flink 生成全新的 `jobId`（128-bit 随机数）
+2. `IcebergCommitter.commit()` 调用 `SinkUtil.getMaxCommittedCheckpointId(table, newJobId, operatorId, branch)`
+3. 遍历所有 snapshot，**没有任何 snapshot 的 `flink.job-id` 匹配这个新 UUID**
+4. 返回 `-1`
+5. `commitRequestMap.headMap(-1, true)` → 空集合，没有被跳过
+6. `commitRequestMap.tailMap(-1, false)` → 所有 checkpoint 都进入 uncommitted，**正常提交**
+
+#### 深入理解
+
+这个设计意味着**多个不同的 Flink 作业可以同时写同一张 Iceberg 表而互不干扰**。每个作业有独立的 jobId，各自的 checkpoint 过滤逻辑完全隔离。唯一需要处理的是 Iceberg 层面的乐观并发冲突（OCC），这由 `TableOperations.commit()` 的重试机制解决。
+
+#### 30 秒速记
+
+- 结论先行：**不会被拦截**。checkpointId 过滤按 `(jobId, operatorId)` 隔离，全新作业的 jobId 不匹配任何历史 snapshot，返回 -1，所有 checkpoint 正常提交。
+- 关键方法：`SinkUtil.getMaxCommittedCheckpointId()` — 遍历 snapshot 链，只匹配同一 jobId 的记录。
+- 面试表达：先说结论（不会），再说原因（jobId 隔离），最后补充（多作业并发写表的安全性）。
+
+---
+<a id="q-3-13"></a>
+### 3.13 Flink JobID 生成机制
+
+**🟡 问题: Flink 的 JobID 是如何生成的？为什么全新启动和恢复启动不会冲突？**
+
+**答案:**
+
+Flink 的 `JobID` 底层是 128-bit 随机数，等价于 UUID。
+
+#### JobID 的数据结构
+
+```java
+// org.apache.flink.api.common.JobID
+public class JobID extends AbstractID {
+    public JobID() {
+        super();  // 调用 AbstractID 的无参构造
+    }
+}
+
+// org.apache.flink.util.AbstractID
+public class AbstractID {
+    private final long lowerPart;
+    private final long upperPart;
+
+    public AbstractID() {
+        this.lowerPart = ThreadLocalRandom.current().nextLong();
+        this.upperPart = ThreadLocalRandom.current().nextLong();
+    }
+}
+```
+
+两个 `long` 组成 128-bit 随机数，碰撞概率极低。
+
+#### 不同场景下的 JobID 行为
+
+| 场景 | JobID 行为 | 说明 |
+|------|-----------|------|
+| **全新提交作业** | `new JobID()` → 全新随机 ID | 与历史 snapshot 无匹配 |
+| **从 savepoint 恢复** | 生成**全新**的 JobID | Flink 框架行为，恢复 ≠ 延续 |
+| **从 checkpoint 恢复** | 生成**全新**的 JobID | 同上 |
+| **手动指定** | `-D execution.job-id=xxx` | 极少使用，测试场景 |
+
+#### 恢复时为什么不会冲突
+
+关键在于 `IcebergFilesCommitter.initializeState()` (第 170-192 行):
+
+```java
+if (context.isRestored()) {
+    // 从 Flink State 中恢复旧作业的 jobId
+    String restoredFlinkJobId = jobIdIterable.iterator().next();
+    // 用旧 jobId 去 Iceberg snapshot 中查找已提交的最大 checkpointId
+    this.maxCommittedCheckpointId =
+        SinkUtil.getMaxCommittedCheckpointId(table, restoredFlinkJobId, operatorUniqueId, branch);
+    // 提交旧作业遗留的未提交数据
+    NavigableMap<Long, byte[]> uncommittedDataFiles =
+        Maps.newTreeMap(checkpointsState.get().iterator().next())
+            .tailMap(maxCommittedCheckpointId, false);
+    if (!uncommittedDataFiles.isEmpty()) {
+        commitUpToCheckpoint(uncommittedDataFiles, restoredFlinkJobId, operatorUniqueId, ...);
+    }
+}
+```
+
+恢复流程的精妙之处:
+1. Flink 分配了新 jobId，但 Committer 从 State 中读出旧 jobId
+2. 用旧 jobId 查 Iceberg snapshot，找到已提交的最大 checkpointId
+3. 将旧作业遗留的未提交数据（从 State 恢复）用旧 jobId 提交
+4. 之后的新 checkpoint 使用新 jobId 提交，开始新的提交序列
+
+> Flink 注释原文 (IcebergFilesCommitter.java:187-190): "Since flink's checkpoint id will start from the max-committed-checkpoint-id + 1 in the new flink job even if it's restored from a snapshot created by another different flink job, so it's safe to assign the max committed checkpoint id from restored flink job to the current flink job."
+
+#### 30 秒速记
+
+- 结论先行：JobID 是 128-bit 随机数（`ThreadLocalRandom` 生成），每次启动/恢复都是全新的。
+- 恢复时的关键：从 Flink State 中恢复旧 jobId，用旧 jobId 查 Iceberg 已提交记录，然后切换到新 jobId 继续。
+- 面试表达：先说 JobID 生成方式，再说恢复时的 State 传递机制，最后总结这保证了多作业并发安全。
+
+---
+<a id="q-3-14"></a>
+### 3.14 insertedRowMap 的生命周期
+
+**🟠 问题: Flink 流式写入 Iceberg 时维护的 `insertedRowMap` 会定时清空吗？它的生命周期是什么？**
+
+**答案:**
+
+**`insertedRowMap` 不会"定时"清空，而是在每次 Checkpoint 时随 writer 整体销毁并重建。每个 Checkpoint 周期就是 insertedRowMap 的完整生命周期。**
+
+#### insertedRowMap 的作用
+
+`insertedRowMap` 定义在 `BaseTaskWriter.BaseEqualityDeltaWriter` 中（`BaseTaskWriter.java:186`），用于记录当前批次内已写入的行的 equality key 到文件路径+行偏移的映射：
+
+```java
+// 源码: core/src/main/java/org/apache/iceberg/io/BaseTaskWriter.java:186,218
+private Map<StructLike, PathOffset> insertedRowMap;
+this.insertedRowMap = StructLikeMap.create(deleteSchema.asStruct());
+```
+
+每次 `write()` 时将 `(equalityKey → filePath+rowOffset)` 写入 map；
+每次 `deleteKey()`/`delete()` 时先在 map 中查找，命中则用 Position Delete（高效），未命中则退化为 Equality Delete。
+
+#### 清空时机：Checkpoint 触发时整体销毁
+
+**SinkV1（`IcebergStreamWriter`）路径**:
+
+```java
+// 源码: IcebergStreamWriter.java:64-67
+public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+    flush(checkpointId);                    // → writer.complete() → writer.close()
+    this.writer = taskWriterFactory.create(); // 创建全新 writer（含空的 insertedRowMap）
+}
+```
+
+**SinkV2（`IcebergSinkWriter`）路径**:
+
+```java
+// 源码: IcebergSinkWriter.java:99-102
+public Collection<WriteResult> prepareCommit() throws IOException {
+    WriteResult result = writer.complete();   // → writer.close()
+    this.writer = taskWriterFactory.create(); // 创建全新 writer
+    // ...
+}
+```
+
+**`close()` 内部显式清空 insertedRowMap**:
+
+```java
+// 源码: BaseTaskWriter.java:330-333
+if (insertedRowMap != null) {
+    insertedRowMap.clear();
+    insertedRowMap = null;
+}
+```
+
+对于分区表，`PartitionedDeltaWriter` 维护 `Map<PartitionKey, RowDataDeltaWriter>`，每个分区一个 DeltaWriter（各自有独立的 insertedRowMap），在 `close()` 时全部关闭并清空：
+
+```java
+// 源码: PartitionedDeltaWriter.java:87-99
+public void close() {
+    super.close();
+    Tasks.foreach(writers.values())
+        .throwFailureWhenFinished()
+        .noRetry()
+        .run(RowDataDeltaWriter::close, IOException.class);
+    writers.clear();  // 所有分区的 writer（含 insertedRowMap）全部销毁
+}
+```
+
+#### 生命周期总结
+
+| 阶段 | insertedRowMap 状态 |
+|---|---|
+| Checkpoint N 开始 | **空的** — 全新 writer 创建 |
+| 两次 Checkpoint 之间 | **持续增长** — 每次 INSERT/UPDATE_AFTER 都 put 一条 |
+| 同 key 再次写入时 | 旧条目被覆盖，对旧行生成 Position Delete |
+| Checkpoint N+1 触发 | **整体销毁** — writer.close() → insertedRowMap.clear() + null |
+| Checkpoint N+1 之后 | **全新空 map** — 新 writer 从零开始 |
+
+#### OOM 风险
+
+由于 insertedRowMap 在两次 Checkpoint 之间持续增长，如果满足以下条件可能导致 OOM：
+- Checkpoint 间隔设置过长（如 30 分钟）
+- 数据量极大且 equality field 基数很高（每行 key 都不同）
+- 多分区写入（每个分区维护独立的 insertedRowMap）
+
+**建议**: CDC 场景下 Checkpoint 间隔通常设置为 1-5 分钟，兼顾 insertedRowMap 内存压力和提交频率。
+
+#### 30 秒速记
+
+- 结论先行：insertedRowMap 随 Checkpoint 周期创建和销毁，不存在"定时清空"机制
+- 关键路径：`prepareSnapshotPreBarrier`/`prepareCommit` → `writer.complete()` → `close()` → `insertedRowMap.clear()`，然后 `taskWriterFactory.create()` 创建全新 writer
+- OOM 风险：Checkpoint 间隔过长 + 高基数 key = insertedRowMap 膨胀，建议 CDC 场景 1-5 分钟
+
+---
+<a id="q-3-15"></a>
+### 3.15 Flink CDC upsert 删除类型与 ConvertEqualityDeleteFiles 现状
+
+**🔴 问题: Flink CDC upsert 模式下的删除一定产生 Equality Delete 文件吗？`ConvertEqualityDeleteFiles` Action 能否将 Equality Delete 转换为 Position Delete？**
+
+**答案:**
+
+**两个关键结论：(1) upsert 删除不一定是 Equality Delete，而是一个两级判断机制；(2) `ConvertEqualityDeleteFiles` 只有接口定义，截至当前版本没有任何引擎实现。**
+
+#### 结论一：upsert 删除优先尝试 Position Delete
+
+在 `BaseDeltaTaskWriter.write()` 中，upsert 模式的 DELETE 和 UPDATE_AFTER 都调用 `deleteKey()`：
+
+```java
+// 源码: BaseDeltaTaskWriter.java:84-111
+switch (row.getRowKind()) {
+    case INSERT:
+    case UPDATE_AFTER:
+        if (upsert) {
+            writer.deleteKey(keyProjection.wrap(row)); // 先尝试删旧
+        }
+        writer.write(row);
+        break;
+    case DELETE:
+        if (upsert) {
+            writer.deleteKey(keyProjection.wrap(row)); // upsert 用 deleteKey
+        } else {
+            writer.delete(row);
+        }
+        break;
+}
+```
+
+`deleteKey()` 内部的两级判断：
+
+```java
+// 源码: BaseTaskWriter.java:273-307
+private boolean internalPosDelete(StructLike key) {
+    PathOffset previous = insertedRowMap.remove(key);
+    if (previous != null) {
+        writePosDelete(previous);  // ✅ 命中 → Position Delete（精确高效）
+        return true;
+    }
+    return false;                  // ❌ 未命中
+}
+
+public void deleteKey(T key) throws IOException {
+    if (!internalPosDelete(asStructLikeKey(key))) {
+        eqDeleteWriter.write(key); // 未命中 → 退化为 Equality Delete
+    }
+}
+```
+
+#### 两种场景对比
+
+| 场景 | insertedRowMap 命中？ | 产生的 Delete 类型 |
+|---|---|---|
+| 同一 Checkpoint 周期内先 INSERT `id=1`，再 DELETE `id=1` | ✅ 命中 | **Position Delete** |
+| DELETE 的 `id=1` 是之前 Checkpoint 或历史批次写入的 | ❌ 未命中 | **Equality Delete** |
+| 同一周期内 INSERT `id=1`，再 UPDATE（deleteKey+write） | ✅ 命中 | **Position Delete**（删旧）+ Data File（写新） |
+
+#### 结论二：ConvertEqualityDeleteFiles 只有接口没有实现
+
+**源码证据**:
+
+```java
+// 源码: api/src/main/java/org/apache/iceberg/actions/ConvertEqualityDeleteFiles.java
+public interface ConvertEqualityDeleteFiles
+    extends SnapshotUpdate<ConvertEqualityDeleteFiles, ConvertEqualityDeleteFiles.Result> {
+    ConvertEqualityDeleteFiles filter(Expression expression);
+}
+
+// 源码: core/src/main/java/org/apache/iceberg/actions/ConvertEqualityDeleteStrategy.java
+public interface ConvertEqualityDeleteStrategy { ... }
+```
+
+**三个关键缺失**:
+
+| 缺失项 | 对比已实现的 rewritePositionDeletes |
+|---|---|
+| `ActionsProvider` 中无注册 | ✅ `rewritePositionDeletes(Table)` 已注册 |
+| `SparkActions` 中无实现 | ✅ `RewritePositionDeleteFilesSparkAction` 已实现 |
+| 全仓库 `implements ConvertEqualityDeleteFiles` 返回 0 结果 | ✅ `implements RewritePositionDeleteFiles` 有实现 |
+
+#### 当前消除 Equality Delete 的可行方案
+
+```
+方案: RewriteDataFiles（间接消除）
+原理:
+1. rewriteDataFiles 读取数据时自动 apply equality delete
+2. 重写后的数据文件已经是"干净"的
+3. 旧的 eq-delete 文件在 expireSnapshots 后变成孤儿文件
+4. deleteOrphanFiles 最终物理删除
+
+执行顺序:
+rewriteDataFiles → expireSnapshots → deleteOrphanFiles
+```
+
+#### 30 秒速记
+
+- 结论先行：upsert 删除不一定是 Equality Delete，`insertedRowMap` 命中时优先 Position Delete；`ConvertEqualityDeleteFiles` 只有接口无实现
+- 两级判断：`internalPosDelete()` 先查 insertedRowMap，命中 → pos-delete，未命中 → eq-delete
+- 替代方案：通过 `rewriteDataFiles` 间接消除 Equality Delete（重写数据时自动 apply），这是目前生产环境的主要手段
+
+---
+
 ## 四、文件管理与优化
 <a id="q-4-1"></a>
 ### 4.1 小文件合并策略
@@ -5119,6 +5543,112 @@ flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetReader
 > 2. Flink 采用**动态规划**: `ContinuousIcebergEnumerator` 周期性发现新快照，`SplitAssigner` 按需分配 split，天然适合流式场景
 >
 > 性能层面的一个关键差异是 **Parquet 向量化读取**: Spark 通过 `VectorizedSparkParquetReaders` 以 `ColumnarBatch` 形式批量处理数据，而 Flink 当前使用行式 `FlinkParquetReaders`，这使得 Spark 在纯批处理场景下的 Parquet 读取性能通常优于 Flink。"
+
+---
+
+<a id="q-5-5"></a>
+### 5.5 元数据列统计指标的存储层级与控制
+
+**问题: Iceberg 的元数据文件会统计每个列的最大值和最小值吗？统计信息存储在哪一层？如何控制统计收集策略？** 🟡
+
+**答案:**
+
+Iceberg 采用**两层统计架构**，不同层级记录不同粒度的列统计信息：
+
+#### 第一层：DataFile 级别（所有列）
+
+每个 DataFile 的元数据中记录**所有列**的统计信息，定义在 `api/src/main/java/org/apache/iceberg/DataFile.java`：
+
+```java
+// DataFile.java 核心统计字段
+Types.MapType COLUMN_SIZES       = /* field 108 */ Map<Integer, Long>    // 每列的字节大小
+Types.MapType VALUE_COUNTS       = /* field 109 */ Map<Integer, Long>    // 每列的值数量
+Types.MapType NULL_VALUE_COUNTS  = /* field 110 */ Map<Integer, Long>    // 每列的 null 值数量
+Types.MapType NAN_VALUE_COUNTS   = /* field 137 */ Map<Integer, Long>    // 每列的 NaN 值数量
+Types.MapType LOWER_BOUNDS       = /* field 125 */ Map<Integer, ByteBuffer> // 每列的最小值
+Types.MapType UPPER_BOUNDS       = /* field 128 */ Map<Integer, ByteBuffer> // 每列的最大值
+```
+
+**关键点**: `LOWER_BOUNDS` 和 `UPPER_BOUNDS` 的 key 是 **column_id**（而非列名），value 是序列化后的边界值。这些统计信息被 `InclusiveMetricsEvaluator` 用于**文件级剪枝**。
+
+#### 第二层：ManifestFile 级别（仅分区列）
+
+ManifestFile 的 `partitions` 字段记录**仅分区列**的汇总统计，定义在 `api/src/main/java/org/apache/iceberg/ManifestFile.java`：
+
+```java
+// ManifestFile.java - PartitionFieldSummary
+Types.StructType PARTITION_SUMMARY_TYPE = Types.StructType.of(
+    required(509, "contains_null", BooleanType.get()),   // 是否包含 null 分区值
+    optional(518, "contains_nan",  BooleanType.get()),   // 是否包含 NaN 分区值
+    optional(510, "lower_bound",   BinaryType.get()),    // 分区字段最小值
+    optional(511, "upper_bound",   BinaryType.get())     // 分区字段最大值
+);
+```
+
+**关键点**: 这一层**仅针对分区字段**，不包含普通列。被 `ManifestEvaluator` 用于**Manifest 级剪枝**——在打开 Manifest 文件之前就跳过不匹配的 Manifest。
+
+#### 两层统计架构对比
+
+| 维度 | DataFile 级别 | ManifestFile 级别 |
+|------|--------------|-------------------|
+| **统计范围** | 所有列（受 metrics mode 控制） | 仅分区列 |
+| **存储位置** | Manifest 文件内的 DataFile 条目 | Manifest 文件头部的 `partitions` 字段 |
+| **统计内容** | lower_bounds, upper_bounds, null_counts, nan_counts, value_counts, column_sizes | lower_bound, upper_bound, contains_null, contains_nan |
+| **用途** | `InclusiveMetricsEvaluator` 文件级剪枝 | `ManifestEvaluator` Manifest 级剪枝 |
+| **剪枝层级** | 第二层（跳过不匹配的 DataFile） | 第一层（跳过整个 Manifest 文件） |
+
+#### MetricsModes：统计收集的 4 种模式
+
+Iceberg 通过 `MetricsModes`（`core/src/main/java/org/apache/iceberg/MetricsModes.java`）提供 4 种收集模式来控制 DataFile 级别的统计信息：
+
+| 模式 | 说明 | 记录内容 |
+|------|------|---------|
+| `none` | 不收集任何统计信息 | 无 |
+| `counts` | 仅收集计数指标 | value_counts, null_value_counts, nan_value_counts |
+| `truncate(N)` | 收集计数 + 截断的边界值（**默认: truncate(16)**） | counts + lower_bounds/upper_bounds（截断到 N 字节） |
+| `full` | 收集计数 + 完整边界值 | counts + lower_bounds/upper_bounds（完整值） |
+
+#### 配置方式
+
+通过 `TableProperties`（`core/src/main/java/org/apache/iceberg/TableProperties.java`）设置：
+
+```sql
+-- 全局默认模式（默认 truncate(16)）
+ALTER TABLE t SET TBLPROPERTIES ('write.metadata.metrics.default' = 'truncate(32)');
+
+-- 针对特定列的模式（覆盖全局默认）
+ALTER TABLE t SET TBLPROPERTIES ('write.metadata.metrics.column.sensitive_col' = 'none');
+ALTER TABLE t SET TBLPROPERTIES ('write.metadata.metrics.column.id' = 'full');
+
+-- 最大自动推断列数（默认 100，超过此数的列不自动收集统计）
+ALTER TABLE t SET TBLPROPERTIES ('write.metadata.metrics.max-inferred-column-defaults' = '200');
+```
+
+#### 多层剪枝的连接关系
+
+```
+查询: SELECT * FROM t WHERE date = '2024-01-01' AND amount > 1000
+
+第1层: ManifestEvaluator（ManifestFile 的 partition summary）
+  → date 分区字段的 lower_bound/upper_bound 不匹配 → 跳过整个 Manifest
+
+第2层: InclusiveMetricsEvaluator（DataFile 的 column bounds）
+  → amount 列的 UPPER_BOUNDS < 1000 → 跳过该 DataFile
+
+第3层: Parquet/ORC RowGroup 级别的 min/max
+  → 引擎利用文件内部统计信息进一步跳过 RowGroup
+
+第4层: 残差过滤器（ResidualEvaluator）
+  → 对剩余行逐行过滤
+```
+
+#### 30 秒速记
+
+- **两层统计**: DataFile 级别记录**所有列**的 min/max（被 InclusiveMetricsEvaluator 使用），ManifestFile 级别**仅记录分区列**的 min/max（被 ManifestEvaluator 使用）
+- **默认 truncate(16)**: 边界值截断到 16 字节，平衡存储开销与剪枝精度
+- **4 种模式**: none → counts → truncate(N) → full，粒度递增
+- **可逐列配置**: `write.metadata.metrics.column.<col>` 覆盖全局默认，敏感列可设为 `none`
+- **面试表达**: "Iceberg 的列统计采用两层架构——ManifestFile 汇总分区列做粗粒度剪枝，DataFile 记录所有列做细粒度剪枝，默认用 truncate(16) 平衡存储与精度"
 
 ---
 
@@ -8392,10 +8922,236 @@ class RoaringPositionBitmap {
 - 升级路径: 通过 Compaction 将 Position Delete 转换为 DV
 - DeleteFileIndex 会同时索引两者,`forDataFile()` 找到 DV 后跳过 Position Delete 查找
 
+#### DV 在 Manifest 中的记录格式（V3 新增字段详解）
+
+DV **复用了** delete manifest 的已有 schema,并没有独立的 manifest 格式。DV 作为 `content=1`（POSITION_DELETES）的条目存在于 delete manifest 中,但通过 3 个 V3 新增字段来唯一标识自身。
+
+**V3 新增的 3 个关键字段（源码: `api/.../DataFile.java`）:**
+
+```java
+// field id=143 — 此 DV 对应的数据文件路径（DV 必填,position delete 可选）
+Types.NestedField REFERENCED_DATA_FILE = optional(143, "referenced_data_file", StringType.get(),
+    "Fully qualified location (URI with FS scheme) of a data file that all deletes reference");
+
+// field id=144 — DV blob 在 Puffin 文件中的起始偏移量（DV 必填）
+Types.NestedField CONTENT_OFFSET = optional(144, "content_offset", LongType.get(),
+    "The offset in the file where the content starts");
+
+// field id=145 — DV blob 的字节长度（DV 必填）
+Types.NestedField CONTENT_SIZE = optional(145, "content_size_in_bytes", LongType.get(),
+    "The length of referenced content stored in the file");
+```
+
+这 3 个字段在 `V3Metadata.fileType()` 中被加入 manifest entry 的 `data_file` struct（行 280-303）:
+
+```java
+// 源码: core/src/main/java/org/apache/iceberg/V3Metadata.java
+static Types.StructType fileType(Types.StructType partitionType) {
+    return Types.StructType.of(
+        DataFile.CONTENT.asRequired(),        // 0: content (int)
+        DataFile.FILE_PATH,                    // 1: file_path
+        DataFile.FILE_FORMAT,                  // 2: file_format
+        required(..., partitionType, ...),     // 3: partition
+        DataFile.RECORD_COUNT,                 // 4: record_count
+        DataFile.FILE_SIZE,                    // 5: file_size_in_bytes
+        DataFile.COLUMN_SIZES,                 // 6-11: 统计信息字段...
+        DataFile.VALUE_COUNTS,
+        DataFile.NULL_VALUE_COUNTS,
+        DataFile.NAN_VALUE_COUNTS,
+        DataFile.LOWER_BOUNDS,
+        DataFile.UPPER_BOUNDS,
+        DataFile.KEY_METADATA,                 // 12: key_metadata
+        DataFile.SPLIT_OFFSETS,                // 13: split_offsets
+        DataFile.EQUALITY_IDS,                 // 14: equality_ids
+        DataFile.SORT_ORDER_ID,                // 15: sort_order_id
+        DataFile.FIRST_ROW_ID,                 // 16: first_row_id (V3, 仅 data file)
+        DataFile.REFERENCED_DATA_FILE,         // 17: ★ referenced_data_file
+        DataFile.CONTENT_OFFSET,               // 18: ★ content_offset
+        DataFile.CONTENT_SIZE);                // 19: ★ content_size_in_bytes
+}
+```
+
+写入时的条件判断（`V3Metadata.DataFileWrapper.get()`，行 454-514）:
+
+```java
+// 仅 content == POSITION_DELETES 时才写入这 3 个字段
+case 17: // referenced_data_file
+    if (wrapped.content() == FileContent.POSITION_DELETES) {
+        return ((DeleteFile) wrapped).referencedDataFile();
+    } else { return null; }
+
+case 18: // content_offset
+    if (wrapped.content() == FileContent.POSITION_DELETES) {
+        return ((DeleteFile) wrapped).contentOffset();
+    } else { return null; }
+
+case 19: // content_size_in_bytes
+    if (wrapped.content() == FileContent.POSITION_DELETES) {
+        return ((DeleteFile) wrapped).contentSizeInBytes();
+    } else { return null; }
+```
+
+**DV 的 Delete Manifest Entry 完整结构:**
+
+```
+ManifestEntry (Avro record)
+├── status              : int        (0=EXISTING, 1=ADDED, 2=DELETED)
+├── snapshot_id         : long?      (所属快照 ID)
+├── sequence_number     : long?      (数据序列号)
+├── file_sequence_number: long?      (文件序列号)
+└── data_file           : struct     (核心文件信息)
+    ├── content             : int=1     ← POSITION_DELETES
+    ├── file_path           : string    ← Puffin 文件路径
+    ├── file_format         : string    ← "puffin"
+    ├── partition           : struct    ← 分区值
+    ├── record_count        : long      ← DV 的基数(被删除的行数)
+    ├── file_size_in_bytes  : long      ← Puffin 文件总大小
+    ├── column_sizes        : null      (DV 不适用)
+    ├── value_counts        : null
+    ├── null_value_counts   : null
+    ├── nan_value_counts    : null
+    ├── lower_bounds        : null
+    ├── upper_bounds        : null
+    ├── key_metadata        : null
+    ├── split_offsets        : null
+    ├── equality_ids        : null      (仅 equality delete 使用)
+    ├── sort_order_id       : null
+    ├── first_row_id        : null      (仅 data file 使用)
+    │
+    │   ====== V3 新增: DV 专用字段 ======
+    ├── referenced_data_file   : string ← ★ 此 DV 对应的数据文件路径 (必填)
+    ├── content_offset         : long   ← ★ DV blob 在 Puffin 文件中的偏移量 (必填)
+    └── content_size_in_bytes  : long   ← ★ DV blob 的字节长度 (必填)
+```
+
+#### DV Manifest Entry 具体示例
+
+**场景**: 表 `db.orders`,分区字段 `order_date`,数据文件含 10000 行,删除第 3、17、42 行。
+
+**Step 1: Puffin 文件结构**
+
+```
+s3://bucket/data/order_date=2024-01-15/00001-delete-dv.puffin
+├─ Header: magic bytes ("PUF1")
+├─ Blob #0 (offset=4, length=38):
+│   type: "deletion-vector-v1"   ← StandardBlobTypes.DV_V1
+│   properties:
+│     referenced-data-file: "s3://bucket/.../00001.parquet"
+│     cardinality: "3"
+│   data (BitmapPositionDeleteIndex 序列化格式):
+│     ┌──────────┬────────────┬──────────────────────┬──────────┐
+│     │ len (4B) │ magic (4B) │ Roaring Bitmap (变长) │ CRC (4B) │
+│     │ 30       │ 0x6433D364 │ {3, 17, 42}          │ checksum │
+│     └──────────┴────────────┴──────────────────────┴──────────┘
+└─ Footer: blob 元数据列表 + magic ("PUF1")
+```
+
+**Step 2: 对应的 Delete Manifest Entry (JSON 表示)**
+
+```json
+{
+  "status": 1,
+  "snapshot_id": 8899001122,
+  "sequence_number": 5,
+  "file_sequence_number": 5,
+  "data_file": {
+    "content": 1,
+    "file_path": "s3://bucket/data/order_date=2024-01-15/00001-delete-dv.puffin",
+    "file_format": "puffin",
+    "partition": { "order_date": "2024-01-15" },
+    "record_count": 3,
+    "file_size_in_bytes": 256,
+    "column_sizes": null,
+    "value_counts": null,
+    "null_value_counts": null,
+    "nan_value_counts": null,
+    "lower_bounds": null,
+    "upper_bounds": null,
+    "key_metadata": null,
+    "split_offsets": null,
+    "equality_ids": null,
+    "sort_order_id": null,
+    "first_row_id": null,
+    "referenced_data_file": "s3://bucket/data/order_date=2024-01-15/00001.parquet",
+    "content_offset": 4,
+    "content_size_in_bytes": 38
+  }
+}
+```
+
+**对比: V2 Position Delete File 的 Manifest Entry**
+
+```json
+{
+  "status": 1,
+  "snapshot_id": 8899001122,
+  "sequence_number": 5,
+  "file_sequence_number": 5,
+  "data_file": {
+    "content": 1,
+    "file_path": "s3://bucket/data/order_date=2024-01-15/00001-pos-del.parquet",
+    "file_format": "parquet",
+    "partition": { "order_date": "2024-01-15" },
+    "record_count": 3,
+    "file_size_in_bytes": 1024,
+    "referenced_data_file": null,
+    "content_offset": null,
+    "content_size_in_bytes": null
+  }
+}
+```
+
+Position Delete 文件**内部**还需存储冗余的文件路径:
+
+```
+| file_path (string)                                      | pos (long) |
+| s3://bucket/data/order_date=2024-01-15/00001.parquet    | 3          |
+| s3://bucket/data/order_date=2024-01-15/00001.parquet    | 17         |
+| s3://bucket/data/order_date=2024-01-15/00001.parquet    | 42         |
+```
+
+#### DV 的读取匹配规则
+
+根据 Iceberg spec,DV 必须应用于数据文件当且仅当同时满足:
+
+```
+1. data_file.file_path == deletion_vector.referenced_data_file   ← 1:1 精确匹配
+2. data_file.data_sequence_number <= deletion_vector.data_sequence_number
+3. data_file.partition == deletion_vector.partition
+```
+
+读取引擎执行流程:
+
+```
+1. 从 delete manifest 读到 DV entry
+2. 用 content_offset + content_size_in_bytes 直接定位 Puffin 文件中的 blob
+   → 无需读取整个 Puffin 文件,支持 range read
+3. 反序列化为 Roaring Bitmap → {3, 17, 42}
+4. 扫描数据文件时: if (bitmap.contains(rowPos)) → skip
+```
+
+**关键规则**: 当 DV 存在时,读取器可以安全地忽略同一数据文件匹配的 position delete files。因为 DV 写入时必须合并所有已有的 position deletes,确保 DV 是完整的删除集合。
+
+#### DV vs Position Delete: Manifest 记录差异总结
+
+| Manifest 字段 | Position Delete (V2) | Deletion Vector (V3) |
+|---------------|---------------------|---------------------|
+| `content` | 1 | 1 |
+| `file_path` | `.parquet` / `.avro` | `.puffin` |
+| `file_format` | "parquet" / "avro" | "puffin" |
+| `record_count` | 删除记录数 | 删除行数（基数） |
+| `file_size_in_bytes` | delete 文件大小 | Puffin 文件大小 |
+| `referenced_data_file` | null 或可选填写 | **必填** — 1:1 绑定数据文件 |
+| `content_offset` | null | **必填** — blob 起始偏移 |
+| `content_size_in_bytes` | null | **必填** — blob 字节长度 |
+| 文件内部存储 | (file_path, pos) 记录列表 | 序列化 Roaring Bitmap |
+| 关联关系 | M:N（一对多/多对多） | **1:1**（每个数据文件最多一个 DV） |
+
 #### 30 秒速记
 
 - 结论先行: DV 使用 Roaring Bitmap,64位拆分为高低32位,三种 Container 自适应选择。
 - 核心优势: 稀疏用 Array(2*count字节),密集用 Bitmap(固定8KB),连续用 Run(4*runs字节)
+- Manifest 记录: DV 复用 delete manifest schema,通过 `referenced_data_file`(必填)、`content_offset`、`content_size_in_bytes` 三个 V3 新增字段标识,`file_format` 为 `puffin`。
 - 面试表达: 先回答"是什么",再补"为什么这样设计",最后给"边界条件/取舍"。
 
 ---
@@ -9130,3 +9886,979 @@ DV 走 Puffin 偏移读取、直接反序列化位图;position delete 则按 del
 2. `trustPartitionMetrics` 标志位及 `addedManifest()` 导致的分区统计清除。
 3. `BaseDeleteLoader` 中 DV 不走缓存的原因(Puffin 读取模式、task locality 不保证)。
 4. `continuousEmptyCheckpoints` 空 checkpoint 处理机制。
+
+---
+
+## 十二、Iceberg 元数据结构体系深度解析
+
+> 基于 Apache Iceberg 源码 (main 分支) 的完整元数据结构分析。所有字段均从源码直接提取，覆盖 V1/V2/V3/V4 版本差异。
+
+<a id="12-1"></a>
+### 12.1 元数据整体架构 — 多级索引树
+
+Iceberg 的元数据并非扁平的文件列表，而是精心设计的**多级树状索引体系**。自顶向下共 5 层，每一层都提供独立的剪枝能力：
+
+```
+TableMetadata (JSON 文件, 位于 metadata/ 目录)
+ |
+ |-- format-version          # 表格式版本 (1/2/3/4)
+ |-- table-uuid              # 表唯一标识
+ |-- location                # 表数据存储根路径
+ |-- schemas[]               # Schema 历史列表
+ |-- partition-specs[]       # 分区规范历史列表
+ |-- sort-orders[]           # 排序规范历史列表
+ |-- properties              # 表属性键值对
+ |-- refs{}                  # 快照引用 (branch/tag)
+ |-- current-snapshot-id     # 当前快照ID
+ |
+ +-- snapshots[]             # 快照列表
+      |
+      |-- snapshot-id         # 快照唯一ID
+      |-- manifest-list       # 指向 Manifest List 文件 (Avro 格式)
+      |
+      +-- ManifestList        # 清单列表 (Avro 文件)
+           |
+           +-- ManifestFile[] # 清单文件条目列表
+                |
+                |-- manifest_path     # 指向 Manifest 文件 (Avro 格式)
+                |-- partitions[]      # 分区字段摘要 (第一层剪枝)
+                |
+                +-- Manifest          # 清单文件 (Avro 文件)
+                     |
+                     +-- ManifestEntry[]  # 清单条目列表
+                          |
+                          |-- status          # EXISTING / ADDED / DELETED
+                          |-- data_file       # 数据文件元数据
+                          |    |
+                          |    +-- ContentFile 字段
+                          |         |-- file_path
+                          |         |-- record_count
+                          |         |-- column_sizes
+                          |         |-- lower_bounds    # 第二层剪枝
+                          |         |-- upper_bounds    # 第二层剪枝
+                          |         |-- null_value_counts
+                          |         |-- ...
+                          |
+                          +-- 实际数据文件 (Parquet/ORC/Avro)
+```
+
+**核心设计理念**: 通过多级索引,查询引擎在规划阶段逐层剪枝,**无需打开任何数据文件**即可排除绝大部分不相关文件,最终只读取真正需要的数据。
+
+---
+
+<a id="12-2"></a>
+### 12.2 TableMetadata — 元数据根节点
+
+**源码**: `core/src/main/java/org/apache/iceberg/TableMetadata.java` (第 243-273 行)
+**序列化**: `core/src/main/java/org/apache/iceberg/TableMetadataParser.java`
+
+#### 12.2.1 完整字段列表
+
+| 字段名 | Java 类型 | JSON 键名 | 说明 |
+|--------|----------|-----------|------|
+| `formatVersion` | `int` | `format-version` | 表格式版本号, 当前支持 1/2/3/4 |
+| `uuid` | `String` | `table-uuid` | 表的全局唯一标识符 (UUID), V2+ 必填 |
+| `location` | `String` | `location` | 表数据存储的根路径 |
+| `lastSequenceNumber` | `long` | `last-sequence-number` | 最近一次提交的序列号, V1 中固定为 0 |
+| `lastUpdatedMillis` | `long` | `last-updated-ms` | 最近一次更新时间戳 (毫秒) |
+| `lastColumnId` | `int` | `last-column-id` | 已分配的最大列 ID, schema evolution 时保证 ID 唯一性 |
+| `currentSchemaId` | `int` | `current-schema-id` | 当前使用的 schema ID |
+| `schemas` | `List<Schema>` | `schemas` | 所有历史 schema 的列表 (含当前) |
+| `defaultSpecId` | `int` | `default-spec-id` | 当前默认的分区规范 ID |
+| `specs` | `List<PartitionSpec>` | `partition-specs` | 所有历史分区规范列表 (含当前) |
+| `lastAssignedPartitionId` | `int` | `last-partition-id` | 已分配的最大分区字段 ID |
+| `defaultSortOrderId` | `int` | `default-sort-order-id` | 当前默认的排序规范 ID |
+| `sortOrders` | `List<SortOrder>` | `sort-orders` | 所有历史排序规范列表 (含当前) |
+| `properties` | `Map<String, String>` | `properties` | 表属性键值对 |
+| `currentSnapshotId` | `long` | `current-snapshot-id` | 当前快照 ID, 无快照时 V1/V2 为 -1, V3+ 为 null |
+| `snapshots` | `List<Snapshot>` | `snapshots` | 快照列表 (支持延迟加载) |
+| `refs` | `Map<String, SnapshotRef>` | `refs` | 快照引用映射 (branch 和 tag) |
+| `snapshotLog` | `List<HistoryEntry>` | `snapshot-log` | 快照变更历史日志 |
+| `previousFiles` | `List<MetadataLogEntry>` | `metadata-log` | 历史元数据文件路径日志 |
+| `statisticsFiles` | `List<StatisticsFile>` | `statistics` | Puffin 格式统计信息文件列表 |
+| `partitionStatisticsFiles` | `List<PartitionStatisticsFile>` | `partition-statistics` | 分区统计信息文件列表 |
+| `nextRowId` | `long` | `next-row-id` | 下一个可分配的行 ID (V3+, 用于 row lineage) |
+| `encryptionKeys` | `List<EncryptedKey>` | `encryption-keys` | 加密密钥列表 (V4) |
+
+#### 12.2.2 关键常量
+
+```
+INITIAL_SEQUENCE_NUMBER = 0        -- 初始序列号
+INVALID_SEQUENCE_NUMBER = -1       -- 无效序列号标记
+DEFAULT_TABLE_FORMAT_VERSION = 2   -- 新建表的默认版本
+SUPPORTED_TABLE_FORMAT_VERSION = 4 -- 最高支持版本
+MIN_FORMAT_VERSION_ROW_LINEAGE = 3 -- Row Lineage 最低要求版本
+INITIAL_SPEC_ID = 0                -- 初始分区规范 ID
+INITIAL_SORT_ORDER_ID = 1          -- 初始排序规范 ID
+INITIAL_SCHEMA_ID = 0              -- 初始 Schema ID
+```
+
+#### 12.2.3 版本约束 (构造函数校验)
+
+- **V1**: `uuid` 可选, `lastSequenceNumber` 必须为 0
+- **V2+**: `uuid` 必填
+- **V3+**: `next-row-id` 必须存在, `current-snapshot-id` 为 null (而非 -1)
+- 序列化时 `last-sequence-number` 仅在 V2+ 写入
+
+---
+
+<a id="12-3"></a>
+### 12.3 Schema — 表结构定义
+
+**源码**: `api/src/main/java/org/apache/iceberg/Schema.java`
+
+#### 12.3.1 Schema 字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `schemaId` | `int` | Schema 的唯一 ID, 默认为 0 |
+| `struct` | `Types.StructType` | 由 `NestedField` 列表组成的结构类型,即表的列定义 |
+| `identifierFieldIds` | `int[]` | 标识符字段 ID 数组 (用于 upsert 场景的主键定义) |
+| `highestFieldId` | `int` | 该 schema 中最大的字段 ID |
+
+#### 12.3.2 NestedField (每个列的定义)
+
+| 属性 | 类型 | 说明 |
+|------|------|------|
+| `id` | `int` | 全局唯一的字段 ID (**schema evolution 的核心**, 列重命名不变) |
+| `name` | `String` | 字段名称 |
+| `type` | `Type` | 字段数据类型 |
+| `isOptional` | `boolean` | 是否可为 null |
+| `doc` | `String` | 字段文档注释 |
+| `initialDefault` | `Object` | 初始默认值 (V3+) |
+| `writeDefault` | `Object` | 写入默认值 (V3+) |
+
+#### 12.3.3 V3 新增类型
+
+| 数据类型 | 最低版本 |
+|---------|----------|
+| `TIMESTAMP_NANO` | V3 |
+| `VARIANT` | V3 |
+| `GEOMETRY` | V3 |
+| `GEOGRAPHY` | V3 |
+| 字段默认值 | V3 |
+
+---
+
+<a id="12-4"></a>
+### 12.4 PartitionSpec — 分区规范
+
+**源码**: `api/src/main/java/org/apache/iceberg/PartitionSpec.java`
+
+#### 12.4.1 字段定义
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `specId` | `int` | 分区规范的唯一 ID |
+| `fields` | `PartitionField[]` | 分区字段数组 |
+| `lastAssignedFieldId` | `int` | 本规范中已分配的最大分区字段 ID |
+
+#### 12.4.2 PartitionField (分区字段)
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `sourceId` | `int` | 源列的字段 ID (指向 Schema 中的列) |
+| `fieldId` | `int` | 分区字段自身的 ID (**从 1000 起始, 与数据列 ID 空间隔离**) |
+| `name` | `String` | 分区字段名称 |
+| `transform` | `Transform` | 分区转换函数 |
+
+#### 12.4.3 支持的 Transform 类型
+
+| Transform | 说明 | 示例 |
+|-----------|------|------|
+| `identity` | 原值分区 | `identity(region)` |
+| `bucket[N]` | 哈希桶分区 | `bucket[16](user_id)` |
+| `truncate[W]` | 截断分区 | `truncate[10](name)` |
+| `year` | 按年分区 | `year(ts)` |
+| `month` | 按月分区 | `month(ts)` |
+| `day` | 按日分区 | `day(ts)` |
+| `hour` | 按小时分区 | `hour(ts)` |
+| `void` | 已废弃的分区字段 | 分区演化中移除字段时使用 |
+
+**关键设计**: 分区字段 ID 从 1000 开始 (`PARTITION_DATA_ID_START = 1000`), 与数据列 ID 空间隔离, 避免冲突。
+
+---
+
+<a id="12-5"></a>
+### 12.5 SortOrder — 排序规范
+
+**源码**: `api/src/main/java/org/apache/iceberg/SortOrder.java`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `orderId` | `int` | 排序规范的唯一 ID (无排序时为 0) |
+| `fields` | `SortField[]` | 排序字段数组 |
+
+**SortField** 字段:
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `sourceId` | `int` | 源列的字段 ID |
+| `transform` | `Transform` | 排序前的转换函数 (可以是 identity) |
+| `direction` | `SortDirection` | 排序方向: `ASC` 或 `DESC` |
+| `nullOrder` | `NullOrder` | NULL 值排序位置: `NULLS_FIRST` 或 `NULLS_LAST` |
+
+---
+
+<a id="12-6"></a>
+### 12.6 Snapshot — 快照
+
+**接口**: `api/src/main/java/org/apache/iceberg/Snapshot.java`
+**实现**: `core/src/main/java/org/apache/iceberg/BaseSnapshot.java`
+
+#### 12.6.1 完整字段
+
+| 字段 | 类型 | JSON 键名 | 说明 |
+|------|------|-----------|------|
+| `snapshotId` | `long` | `snapshot-id` | 快照的全局唯一 ID |
+| `parentId` | `Long` | `parent-snapshot-id` | 父快照 ID (首个快照为 null) |
+| `sequenceNumber` | `long` | `sequence-number` | 快照的序列号 (V2+, 提交时分配) |
+| `timestampMillis` | `long` | `timestamp-ms` | 快照创建时间戳 |
+| `manifestListLocation` | `String` | `manifest-list` | Manifest List 文件路径 |
+| `operation` | `String` | 嵌入 `summary` | 操作类型 |
+| `summary` | `Map<String, String>` | `summary` | 快照摘要 (操作类型 + 统计) |
+| `schemaId` | `Integer` | `schema-id` | 创建快照时使用的 schema ID |
+| `firstRowId` | `Long` | `first-row-id` | 首个新增行的行 ID (V3+) |
+| `addedRows` | `Long` | `added-rows` | 分配了行 ID 的行数上界 (V3+) |
+
+#### 12.6.2 操作类型 (DataOperations)
+
+| 操作 | 值 | 说明 | 对应 API |
+|------|-----|------|---------|
+| append | `"append"` | 追加新数据, 不删除不替换 | `AppendFiles` |
+| replace | `"replace"` | 替换文件但不改变数据 (如 compaction) | `RewriteFiles` |
+| overwrite | `"overwrite"` | 用新数据覆盖现有数据 | `OverwriteFiles` |
+| delete | `"delete"` | 仅删除数据, 不追加 | `DeleteFiles` |
+
+#### 12.6.3 summary 常见统计条目
+
+| 键 | 说明 |
+|----|------|
+| `operation` | 操作类型 (必填) |
+| `added-data-files` | 新增数据文件数 |
+| `deleted-data-files` | 删除数据文件数 |
+| `added-delete-files` | 新增删除文件数 |
+| `added-records` / `deleted-records` | 新增/删除记录数 |
+| `added-files-size` / `removed-files-size` | 新增/移除文件大小 |
+| `total-records` | 表总记录数 |
+| `total-data-files` / `total-delete-files` | 表总数据/删除文件数 |
+
+#### 12.6.4 Manifest 的惰性加载
+
+`BaseSnapshot` 的设计:
+1. 创建时**仅保存** `manifestListLocation` 路径,不读取文件
+2. 首次调用 `allManifests(FileIO)` 时才读取 Manifest List
+3. 读取后自动分类为 `dataManifests` 和 `deleteManifests`
+4. 结果缓存在 transient 字段中,避免重复 I/O
+
+---
+
+<a id="12-7"></a>
+### 12.7 SnapshotRef — 快照引用
+
+**源码**: `api/src/main/java/org/apache/iceberg/SnapshotRef.java`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `snapshotId` | `long` | 引用指向的快照 ID |
+| `type` | `SnapshotRefType` | `BRANCH` (可变, 新提交推进) 或 `TAG` (不可变, 固定快照) |
+| `minSnapshotsToKeep` | `Integer` | 最少保留快照数 (仅 BRANCH) |
+| `maxSnapshotAgeMs` | `Long` | 快照最大保留时间 (仅 BRANCH) |
+| `maxRefAgeMs` | `Long` | 引用自身的最大存活时间 |
+
+**主分支**: `SnapshotRef.MAIN_BRANCH = "main"`, 当 `refs` 字段不存在但 `current-snapshot-id` 有效时, 解析器自动初始化 main branch。
+
+---
+
+<a id="12-8"></a>
+### 12.8 ManifestFile — 清单文件元数据
+
+**接口**: `api/src/main/java/org/apache/iceberg/ManifestFile.java`
+
+Manifest List 是 Avro 格式文件, 每行一个 `ManifestFile` 记录。
+
+#### 12.8.1 完整字段 (含 Avro Field ID)
+
+| 字段名 | Field ID | 类型 | 说明 |
+|--------|----------|------|------|
+| `manifest_path` | 500 | `string` (required) | Manifest 文件的完整 URI |
+| `manifest_length` | 501 | `long` (required) | Manifest 文件大小 |
+| `partition_spec_id` | 502 | `int` (required) | 写入时使用的分区规范 ID |
+| `content` | 517 | `int` (optional) | 内容类型: 0=DATA, 1=DELETES (V2+) |
+| `sequence_number` | 515 | `long` (optional) | 添加此 Manifest 的提交序列号 |
+| `min_sequence_number` | 516 | `long` (optional) | 所有存活文件的最小数据序列号 |
+| `added_snapshot_id` | 503 | `long` (required) | 添加此 Manifest 的快照 ID |
+| `added_files_count` | 504 | `int` (optional) | ADDED 状态的文件数 |
+| `existing_files_count` | 505 | `int` (optional) | EXISTING 状态的文件数 |
+| `deleted_files_count` | 506 | `int` (optional) | DELETED 状态的文件数 |
+| `added_rows_count` | 512 | `long` (optional) | ADDED 文件的总行数 |
+| `existing_rows_count` | 513 | `long` (optional) | EXISTING 文件的总行数 |
+| `deleted_rows_count` | 514 | `long` (optional) | DELETED 文件的总行数 |
+| `partitions` | 507 | `list<PartitionFieldSummary>` | **每个分区字段的统计摘要** |
+| `key_metadata` | 519 | `binary` (optional) | 加密密钥元数据 |
+| `first_row_id` | 520 | `long` (optional) | ADDED 数据文件中起始行 ID (V3+) |
+
+#### 12.8.2 PartitionFieldSummary (分区字段摘要 — 第一层剪枝的关键)
+
+| 字段 | Field ID | 类型 | 说明 |
+|------|----------|------|------|
+| `contains_null` | 509 | `boolean` | 任一文件是否包含 null 分区值 |
+| `contains_nan` | 518 | `boolean` | 任一文件是否包含 NaN 分区值 |
+| `lower_bound` | 510 | `binary` | 所有文件的分区值**下界** |
+| `upper_bound` | 511 | `binary` | 所有文件的分区值**上界** |
+
+> **读取时作用**: 查询引擎拿到查询谓词后, 首先与 ManifestFile 的 `partitions` 中的 `lower_bound`/`upper_bound` 做范围比较。如果整个 Manifest 的分区范围与谓词不重叠, 直接跳过此 Manifest, **无需打开 Manifest 文件读取其中的条目**。这是最粗粒度的剪枝。
+
+---
+
+<a id="12-9"></a>
+### 12.9 ManifestEntry — 清单条目
+
+**源码**: `core/src/main/java/org/apache/iceberg/ManifestEntry.java`
+
+每个 Manifest 文件 (Avro 格式) 中的一行记录:
+
+| 字段 | Field ID | 类型 | 说明 |
+|------|----------|------|------|
+| `status` | 0 | `int` | 文件状态: EXISTING(0) / ADDED(1) / DELETED(2) |
+| `snapshot_id` | 1 | `long` | 将文件添加到表中的快照 ID |
+| `sequence_number` | 3 | `long` | 数据序列号 |
+| `file_sequence_number` | 4 | `long` | 文件序列号 |
+| `data_file` | 2 | `struct` | 嵌套的数据文件/删除文件元数据 (ContentFile) |
+
+#### 两种序列号的语义差异
+
+**data sequence number (数据序列号)**:
+- 表示文件中数据**所属的逻辑时间点**
+- compaction 新产生的文件保留原文件的数据序列号 (数据内容未变)
+- 用于确定 equality delete 的生效范围: delete 仅对 `data_seq <= delete_seq` 的数据文件生效
+
+**file sequence number (文件序列号)**:
+- 表示文件被**物理添加到表中**的快照序列号
+- commit 时自动分配, 不可手动指定
+- compaction 中 `file_seq > data_seq` (新文件,旧数据)
+
+---
+
+<a id="12-10"></a>
+### 12.10 ContentFile / DataFile / DeleteFile — 数据文件元数据
+
+**ContentFile**: `api/src/main/java/org/apache/iceberg/ContentFile.java`
+**DataFile**: `api/src/main/java/org/apache/iceberg/DataFile.java`
+
+#### 12.10.1 DataFile 的 Avro StructType 完整定义 (Field ID 100-145)
+
+| 字段名 | Field ID | 类型 | 说明 |
+|--------|----------|------|------|
+| `content` | 134 | `int` | 内容类型: 0=DATA, 1=POSITION_DELETES, 2=EQUALITY_DELETES |
+| `file_path` | 100 | `string` | 文件完整 URI |
+| `file_format` | 101 | `string` | 文件格式: avro/orc/parquet |
+| `partition` | 102 | `struct` | 分区数据元组 |
+| `record_count` | 103 | `long` | 文件中的记录数 |
+| `file_size_in_bytes` | 104 | `long` | 文件总大小 |
+| `column_sizes` | 108 | `map<int, long>` | **列 ID -> 列在磁盘上的大小** |
+| `value_counts` | 109 | `map<int, long>` | **列 ID -> 值总数** (含 null 和 NaN) |
+| `null_value_counts` | 110 | `map<int, long>` | **列 ID -> null 值数量** |
+| `nan_value_counts` | 137 | `map<int, long>` | **列 ID -> NaN 值数量** |
+| `lower_bounds` | 125 | `map<int, binary>` | **列 ID -> 列值下界** (第二层剪枝) |
+| `upper_bounds` | 128 | `map<int, binary>` | **列 ID -> 列值上界** (第二层剪枝) |
+| `key_metadata` | 131 | `binary` | 加密密钥元数据 |
+| `split_offsets` | 132 | `list<long>` | 推荐分片偏移量 |
+| `equality_ids` | 135 | `list<int>` | 等值比较字段 ID 列表 (equality delete 专用) |
+| `sort_order_id` | 140 | `int` | 排序规范 ID |
+| `spec_id` | 141 | `int` | 分区规范 ID |
+| `first_row_id` | 142 | `long` | 首行的行 ID (V3+) |
+| `referenced_data_file` | 143 | `string` | Deletion Vector 引用的数据文件路径 (V3+) |
+| `content_offset` | 144 | `long` | Puffin 文件中 DV blob 的起始偏移 (V3+) |
+| `content_size_in_bytes` | 145 | `long` | DV blob 的大小 (V3+) |
+
+#### 12.10.2 统计信息字段详解
+
+**lower_bounds / upper_bounds**:
+- 键为列 ID, 值为 Iceberg 内部二进制序列化格式
+- 序列化规则: `int`/`long` 小端字节序, `string` UTF-8 (可截断到前 16 字节), `timestamp` 以 microseconds 的 long 值, `decimal` 大端无缩放整数
+- **截断优化**: bounds 值可截断以节省空间, 截断后 lower_bound 向下取整, upper_bound 向上取整, 保证过滤正确性
+- **读取时作用**: 查询引擎用谓词与每个文件的 bounds 比较, 例如 `WHERE ts > '2024-01-01'` 时若某文件 `upper_bound(ts) < '2024-01-01'`, 直接跳过
+
+**column_sizes**:
+- 表示该列在磁盘上编码后的大小 (字节)
+- **读取时作用**: 查询引擎据此估算读取特定列的 I/O 成本, 辅助代价估计 (cost-based optimization)
+
+**value_counts / null_value_counts / nan_value_counts**:
+- `value_counts` 包含所有值 (含 null 和 NaN)
+- 引擎可用 `value_counts - null_value_counts` 得到非 null 值计数
+- **全 null 列优化**: 若 `null_value_counts == value_counts`, 该列全为 null, 含 `IS NOT NULL` 谓词时可直接跳过此文件
+
+---
+
+<a id="12-11"></a>
+### 12.11 StatisticsFile 与 PartitionStatisticsFile
+
+**StatisticsFile**: `api/src/main/java/org/apache/iceberg/StatisticsFile.java`
+
+统计信息文件使用 **Puffin 格式**存储,包含如 NDV (Number of Distinct Values) 等高级统计数据。
+
+| 字段 | JSON 键名 | 说明 |
+|------|-----------|------|
+| `snapshotId` | `snapshot-id` | 关联的快照 ID |
+| `path` | `statistics-path` | 统计文件的完整路径 |
+| `fileSizeInBytes` | `file-size-in-bytes` | 文件大小 |
+| `fileFooterSizeInBytes` | `file-footer-size-in-bytes` | Puffin footer 大小 |
+| `blobMetadata` | `blob-metadata` | 统计 blob 列表 |
+
+**BlobMetadata** 字段:
+
+| 字段 | 说明 |
+|------|------|
+| `type` | Blob 类型 (如 `"apache-datasketches-theta-v1"`) |
+| `sourceSnapshotId` | 计算该 blob 时表的快照 ID |
+| `fields` | 计算该 blob 使用的列字段 ID 列表 |
+| `properties` | 附加属性 (如 `{"ndv": "95000"}`) |
+
+**PartitionStatisticsFile**: 存储分区级别的聚合统计, 如每个分区的文件数量、记录数、文件大小等。
+
+---
+
+<a id="12-12"></a>
+### 12.12 版本差异对比矩阵 (V1/V2/V3/V4)
+
+| 特性 | V1 | V2 | V3 | V4 |
+|------|----|----|----|----|
+| 序列号 | 不支持 (固定 0) | 支持 | 支持 | 支持 |
+| UUID | 可选 | 必填 | 必填 | 必填 |
+| Delete 文件 | 不支持 | position + equality | 支持 | 支持 |
+| ManifestContent 字段 | 不存在 | DATA/DELETES | DATA/DELETES | DATA/DELETES |
+| current-snapshot-id (无快照) | -1 | -1 | null | null |
+| Row Lineage (next-row-id) | 不支持 | 不支持 | 支持 | 支持 |
+| TIMESTAMP_NANO / VARIANT 等 | 不支持 | 不支持 | 支持 | 支持 |
+| 字段默认值 | 不支持 | 不支持 | 支持 | 支持 |
+| Deletion Vector | 不支持 | 不支持 | 支持 | 支持 |
+| 加密密钥 | 不支持 | 不支持 | 不支持 | 支持 |
+| V1 兼容写入 | 同时写 `schema`+`schemas` | 仅 `schemas` | 仅 `schemas` | 仅 `schemas` |
+
+---
+
+<a id="12-13"></a>
+### 12.13 元数据在读写场景中的作用
+
+#### 12.13.1 写入流程
+
+```
+数据写入 (如 AppendFiles)
+    |
+    v
+1. 写入数据文件 (Parquet/ORC/Avro)
+   - 写入过程中收集列级统计:
+     column_sizes, value_counts, null_value_counts,
+     nan_value_counts, lower_bounds, upper_bounds
+   - 记录 record_count, file_size_in_bytes
+   - 计算 split_offsets
+    |
+    v
+2. 创建 ManifestEntry (status=ADDED)
+   - 填入所有 ContentFile 元数据字段
+   - snapshot_id 设为当前快照
+    |
+    v
+3. 写入 Manifest 文件 (Avro 格式)
+   - 包含新增的 ManifestEntry 条目
+   - 可能继承/合并已有 Manifest
+   - 计算 PartitionFieldSummary (分区字段摘要)
+   - 统计 added_files_count, added_rows_count 等
+    |
+    v
+4. 写入 Manifest List 文件 (Avro 格式)
+   - 包含所有活跃的 ManifestFile 条目
+   - 新增 Manifest + 继承的旧 Manifest
+    |
+    v
+5. 创建 Snapshot
+   - 分配 snapshot-id, sequence-number
+   - 指向新的 Manifest List
+   - 计算 summary 统计信息
+    |
+    v
+6. 更新 TableMetadata
+   - 添加新 Snapshot 到 snapshots 列表
+   - 更新 current-snapshot-id
+   - 更新 refs (推进 main branch)
+   - 递增 last-sequence-number
+   - 更新 last-updated-ms
+    |
+    v
+7. 原子提交 (写入新的 metadata JSON 文件)
+   - 乐观并发控制: 比较 base metadata, 冲突时重试
+```
+
+#### 12.13.2 读取流程 (查询规划与多层剪枝)
+
+```
+查询: SELECT * FROM t WHERE ts > '2024-01-01' AND region = 'US'
+    |
+    v
+1. 读取 TableMetadata
+   - 获取 current-snapshot-id (或 time travel 指定历史快照)
+   - 获取当前 schema, partition-spec
+    |
+    v
+2. 读取当前 Snapshot
+   - 获取 manifest-list 路径
+    |
+    v
+3. 读取 Manifest List → ManifestFile 列表
+   ╔═══════════════════════════════════════════╗
+   ║  第一层剪枝: Manifest 级别               ║
+   ║  - content 字段: 仅读取 DATA manifest    ║
+   ║  - partitions[] 的 lower_bound/upper_bound║
+   ║    与谓词做范围比较:                      ║
+   ║    * day(ts) 的 bounds 是否与              ║
+   ║      ts > '2024-01-01' 重叠?              ║
+   ║    * identity(region) 的 bounds           ║
+   ║      是否包含 'US'?                       ║
+   ║  → 跳过不满足条件的整个 Manifest          ║
+   ╚═══════════════════════════════════════════╝
+    |
+    v
+4. 读取匹配的 Manifest → ManifestEntry 列表
+   ╔═══════════════════════════════════════════╗
+   ║  第二层剪枝: 文件级别                    ║
+   ║  - 检查 status: 仅关注 ADDED/EXISTING    ║
+   ║  - 检查 data_file 的 partition 值:        ║
+   ║    精确匹配分区谓词                       ║
+   ║  - 检查 lower_bounds/upper_bounds:        ║
+   ║    * ts 的 upper_bound < '2024-01-01'     ║
+   ║      → 跳过此文件                        ║
+   ║    * region 的 bounds 不含 'US'           ║
+   ║      → 跳过此文件                        ║
+   ║  - 检查 null_value_counts:                ║
+   ║    * IS NOT NULL 且列全 null → 跳过       ║
+   ╚═══════════════════════════════════════════╝
+    |
+    v
+5. 生成 ScanTask 列表
+   - 利用 split_offsets 将大文件拆分
+   - 利用 file_size_in_bytes, column_sizes 估算 I/O
+   - 关联对应的 delete 文件 (通过 sequence number 匹配)
+    |
+    v
+6. 执行数据读取
+   - 读取实际数据文件
+   - 应用 delete 文件 (position deletes / equality deletes)
+```
+
+#### 12.13.3 Compaction / Maintenance 流程
+
+```
+Compaction (RewriteFiles) 流程:
+  1. 扫描小文件: 利用 file_size_in_bytes 判断是否需要合并
+  2. 合并写入: 新文件的 data_sequence_number 取原文件的最小值
+     (逻辑上数据仍属于原始时间点, 保证 delete 文件语义不变)
+  3. 创建 Snapshot (operation = "replace"):
+     旧文件标记 DELETED, 新文件标记 ADDED
+
+Snapshot 过期 (ExpireSnapshots) 流程:
+  1. 确定可过期快照: 考虑 SnapshotRef 保留策略
+  2. 清理文件: 比较新旧 Manifest List, 找出无引用的文件
+  3. 更新 TableMetadata: 移除过期快照, 更新 snapshot-log
+```
+
+---
+
+<a id="12-14"></a>
+### 12.14 完整 TableMetadata JSON 示例 (V2 格式)
+
+以下结构严格对照 `TableMetadataParser.toJson()` 的序列化顺序:
+
+```json
+{
+  "format-version": 2,
+  "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+  "location": "s3://warehouse/db/sample_table",
+  "last-sequence-number": 5,
+  "last-updated-ms": 1710000000000,
+  "last-column-id": 5,
+
+  "current-schema-id": 0,
+  "schemas": [
+    {
+      "schema-id": 0,
+      "type": "struct",
+      "fields": [
+        {"id": 1, "name": "id", "required": true, "type": "long"},
+        {"id": 2, "name": "data", "required": false, "type": "string"},
+        {"id": 3, "name": "ts", "required": true, "type": "timestamptz"},
+        {"id": 4, "name": "category", "required": false, "type": "string"},
+        {"id": 5, "name": "amount", "required": false, "type": "double"}
+      ],
+      "identifier-field-ids": [1]
+    }
+  ],
+
+  "default-spec-id": 0,
+  "partition-specs": [
+    {
+      "spec-id": 0,
+      "fields": [
+        {"source-id": 3, "field-id": 1000, "name": "ts_day", "transform": "day"},
+        {"source-id": 4, "field-id": 1001, "name": "category", "transform": "identity"}
+      ]
+    }
+  ],
+
+  "last-partition-id": 1001,
+
+  "default-sort-order-id": 1,
+  "sort-orders": [
+    {"order-id": 0, "fields": []},
+    {
+      "order-id": 1,
+      "fields": [
+        {"source-id": 3, "transform": "identity", "direction": "asc", "null-order": "nulls-first"}
+      ]
+    }
+  ],
+
+  "properties": {
+    "write.parquet.compression-codec": "zstd",
+    "commit.retry.num-retries": "4",
+    "write.metadata.delete-after-commit.enabled": "true",
+    "write.metadata.previous-versions-max": "10"
+  },
+
+  "current-snapshot-id": 3497810964824022504,
+
+  "refs": {
+    "main": {
+      "snapshot-id": 3497810964824022504,
+      "type": "branch"
+    },
+    "audit-2024-q1": {
+      "snapshot-id": 3497810964824022501,
+      "type": "tag",
+      "max-ref-age-ms": 15552000000
+    }
+  },
+
+  "snapshots": [
+    {
+      "snapshot-id": 3497810964824022501,
+      "timestamp-ms": 1709000000000,
+      "summary": {
+        "operation": "append",
+        "added-data-files": "5",
+        "added-records": "100000",
+        "added-files-size": "31457280",
+        "total-records": "100000",
+        "total-files-size": "31457280",
+        "total-data-files": "5"
+      },
+      "manifest-list": "s3://warehouse/db/sample_table/metadata/snap-3497810964824022501-0-abc.avro",
+      "schema-id": 0
+    },
+    {
+      "sequence-number": 3,
+      "snapshot-id": 3497810964824022502,
+      "parent-snapshot-id": 3497810964824022501,
+      "timestamp-ms": 1709500000000,
+      "summary": {
+        "operation": "append",
+        "added-data-files": "3",
+        "added-records": "50000",
+        "total-records": "150000",
+        "total-data-files": "8"
+      },
+      "manifest-list": "s3://warehouse/db/sample_table/metadata/snap-3497810964824022502-0-def.avro",
+      "schema-id": 0
+    },
+    {
+      "sequence-number": 5,
+      "snapshot-id": 3497810964824022504,
+      "parent-snapshot-id": 3497810964824022502,
+      "timestamp-ms": 1710000000000,
+      "summary": {
+        "operation": "replace",
+        "added-data-files": "2",
+        "deleted-data-files": "8",
+        "added-records": "150000",
+        "deleted-records": "150000",
+        "total-records": "150000",
+        "total-data-files": "2"
+      },
+      "manifest-list": "s3://warehouse/db/sample_table/metadata/snap-3497810964824022504-0-ghi.avro",
+      "schema-id": 0
+    }
+  ],
+
+  "statistics": [
+    {
+      "snapshot-id": 3497810964824022504,
+      "statistics-path": "s3://warehouse/db/sample_table/metadata/stats-3497810964824022504.puffin",
+      "file-size-in-bytes": 51200,
+      "file-footer-size-in-bytes": 256,
+      "blob-metadata": [
+        {
+          "type": "apache-datasketches-theta-v1",
+          "snapshot-id": 3497810964824022504,
+          "sequence-number": 5,
+          "fields": [1],
+          "properties": {"ndv": "95000"}
+        }
+      ]
+    }
+  ],
+
+  "partition-statistics": [
+    {
+      "snapshot-id": 3497810964824022504,
+      "statistics-path": "s3://warehouse/db/sample_table/metadata/partition-stats.parquet",
+      "file-size-in-bytes": 10240
+    }
+  ],
+
+  "snapshot-log": [
+    {"timestamp-ms": 1709000000000, "snapshot-id": 3497810964824022501},
+    {"timestamp-ms": 1709500000000, "snapshot-id": 3497810964824022502},
+    {"timestamp-ms": 1710000000000, "snapshot-id": 3497810964824022504}
+  ],
+
+  "metadata-log": [
+    {"timestamp-ms": 1709000000000, "metadata-file": "s3://warehouse/db/sample_table/metadata/00000-uuid-1.metadata.json"},
+    {"timestamp-ms": 1709500000000, "metadata-file": "s3://warehouse/db/sample_table/metadata/00001-uuid-2.metadata.json"}
+  ]
+}
+```
+
+#### V3 格式差异示例
+
+V3 在 V2 基础上新增:
+
+```json
+{
+  "format-version": 3,
+  "current-snapshot-id": null,
+  "next-row-id": 150000,
+  "snapshots": [
+    {
+      "sequence-number": 5,
+      "snapshot-id": 3497810964824022504,
+      "first-row-id": 100000,
+      "added-rows": 50000,
+      "...其余字段与 V2 相同..."
+    }
+  ]
+}
+```
+
+---
+
+<a id="12-15"></a>
+### 12.15 五大用户特性的元数据架构实现原理
+
+> 结合 Iceberg 官方提出的五大用户体验特性, 分析它们各自是如何基于上述元数据架构实现的。
+
+#### 12.15.1 Schema Evolution — 无副作用的表结构演进
+
+**用户体验**: 支持 add, drop, update, rename 列操作, 不会意外恢复已删除的数据。
+
+**元数据实现原理**:
+
+Iceberg schema evolution 的核心在于**列 ID (field ID) 而非列名**。这一设计贯穿了从 `TableMetadata` 到 `DataFile` 的整个元数据体系:
+
+1. **Schema 中的 `NestedField.id`**: 每个列被分配一个全局唯一的整数 ID, 列重命名只改 `name` 不改 `id`。`TableMetadata.lastColumnId` 保证 ID 只增不减, 因此**删除列后重新添加同名列会得到不同的 ID**。
+
+2. **数据文件中的统计信息以 ID 为键**: `lower_bounds`、`upper_bounds`、`column_sizes` 等映射的键都是 `int` 类型的列 ID, 不是列名。这意味着:
+   - 删除列 `status` (id=5) 后, 所有历史文件中 id=5 的统计信息**仍然有效但不再被查询**
+   - 新增同名列 `status` 获得 id=8, 与历史数据完全隔离
+
+3. **schemas 列表保存完整历史**: `TableMetadata.schemas[]` 记录了所有历史版本的 schema。每个 `Snapshot.schemaId` 记录了写入时使用的 schema 版本。读取历史快照时, 引擎用该 schemaId 找到正确的 schema 进行数据解释。
+
+4. **不会 un-delete 数据**: 因为列 ID 是单调递增的 (`lastColumnId` 只增不减), 即使删除一列再添加同名列, 旧文件中该列的数据不会被新 schema 重新引用。这从根本上避免了 Hive 等系统中"添加同名列导致已删除数据复活"的问题。
+
+```
+Schema V0: {id:1 "user_id", id:2 "status", id:3 "ts"}
+  ↓ DROP COLUMN status
+Schema V1: {id:1 "user_id", id:3 "ts"}        lastColumnId=3
+  ↓ ADD COLUMN status
+Schema V2: {id:1 "user_id", id:3 "ts", id:4 "status"}  lastColumnId=4
+  → id:4 ≠ id:2, 旧文件中 id:2 的数据永远不会被 id:4 读到
+```
+
+#### 12.15.2 Hidden Partitioning — 对用户透明的分区
+
+**用户体验**: 用户无需了解分区细节即可获得快速查询, 避免因分区使用错误导致的静默错误结果或极慢查询。
+
+**元数据实现原理**:
+
+传统 Hive 分区要求用户显式指定分区列并在查询中使用分区列值进行过滤。Iceberg 通过 `PartitionSpec` 中的 **Transform** 机制将分区逻辑与用户查询解耦:
+
+1. **PartitionSpec.fields 中的 Transform**: 分区字段不是数据列本身, 而是通过 transform 函数从源列派生:
+   ```
+   源列 ts (timestamptz) → transform: day → 分区字段 ts_day
+   ```
+   用户查询 `WHERE ts > '2024-01-01'` 时, 引擎**自动将谓词映射到分区字段**: `ts_day >= day('2024-01-01')`。
+
+2. **ManifestFile.partitions[] 的 bounds**: 查询引擎将转换后的谓词与 Manifest 级别的分区摘要 (`lower_bound`/`upper_bound`) 比较, 实现剪枝。这一过程完全发生在引擎内部, 用户只需写基于源列的谓词。
+
+3. **DataFile.partition 元组**: 每个数据文件记录了自己的分区值元组, 引擎在文件级别再做一次精确匹配。
+
+4. **分区字段 ID 空间隔离**: 分区字段 ID 从 1000 起始, 与数据列 ID (从 1 起) 完全隔离。这是一个实现细节, 但保证了分区演化不会与 schema evolution 冲突。
+
+**为什么能防止"静默错误"**: Hive 中如果用户忘记用分区列过滤, 查询会扫描全表但仍返回"正确"结果, 只是极慢。如果用户用错误的格式过滤分区列 (如 `month = 'January'` 但实际分区值是 `1`), 会得到空结果。Iceberg 中用户根本不操作分区列, 永远只用源列, 所以不存在这些问题。
+
+#### 12.15.3 Partition Layout Evolution — 分区布局演化
+
+**用户体验**: 当数据量或查询模式变化时, 可以更新表的分区布局, 无需重写已有数据。
+
+**元数据实现原理**:
+
+1. **TableMetadata.specs[] 保存完整历史**: 所有历史分区规范都保留在 `partition-specs[]` 列表中, `default-spec-id` 指向当前使用的规范。新数据使用新规范, 旧数据保持原有分区。
+
+2. **DataFile.spec_id 与 ManifestFile.partition_spec_id**: 每个数据文件和 Manifest 文件都记录了写入时使用的分区规范 ID。读取时, 引擎根据 `spec_id` 找到对应的 PartitionSpec, 正确解释该文件的 partition 元组。
+
+3. **void Transform**: 当移除某个分区字段时, 该字段的 transform 被设置为 `void`, 表示"已废弃"。旧文件中该字段的值仍存在但被忽略。
+
+4. **查询引擎如何处理多规范**: 查询规划时, 引擎遍历所有 ManifestFile, 对每个 Manifest 根据其 `partition_spec_id` 选择对应的规范来解释 `partitions[]` 摘要。不同规范的文件可以在同一次查询中共存。
+
+```
+初始: spec-0 = day(ts)
+  → 所有文件的 partition_spec_id = 0
+
+演化后: spec-1 = hour(ts)
+  → 新写入文件的 partition_spec_id = 1
+  → 旧文件仍然是 partition_spec_id = 0, 数据不变
+  → 查询时引擎同时处理两种规范的文件
+```
+
+#### 12.15.4 Time Travel — 时间旅行查询
+
+**用户体验**: 支持使用完全相同的表快照进行可复现的查询, 或让用户轻松查看数据变更。
+
+**元数据实现原理**:
+
+1. **快照链**: `Snapshot.parentId` 形成一条从当前快照到初始快照的链。每个快照是一个完整的、不可变的表状态视图。
+
+2. **TableMetadata.snapshots[]**: 保存了所有未过期的快照列表。通过 `snapshot-id` 或 `timestamp-ms` 可以定位到任意历史快照。
+
+3. **Manifest List 的不可变性**: 每个 `Snapshot.manifestListLocation` 指向一个不可变的 Manifest List 文件。该文件列出了该时间点所有有效的 Manifest, 进而包含了所有有效的数据文件。因此, **读取一个历史快照等价于读取其 Manifest List 中引用的所有数据文件**。
+
+4. **snapshot-log**: `TableMetadata.snapshotLog[]` 按时间序记录了每次快照变更, 支持 `TIMESTAMP AS OF` 语法 — 引擎在 log 中二分查找对应时间点的快照 ID。
+
+5. **refs (tag)**: 通过 tag 可以给特定快照命名 (如 `audit-2024-q1`), 方便反复查询同一历史状态。tag 引用的快照不会被 `ExpireSnapshots` 清理 (在 `maxRefAgeMs` 内)。
+
+6. **metadata-log**: 记录了历史元数据文件的路径。即使当前 TableMetadata JSON 被更新, 旧的 metadata JSON 仍保留在存储系统中, 可用于极端场景下的恢复。
+
+```
+当前 metadata JSON
+  └── current-snapshot-id: snap-5
+      └── manifest-list → snap-5 的文件集合
+
+Time Travel: TIMESTAMP AS OF '2024-01-15'
+  → 在 snapshot-log 中找到 timestamp ≤ '2024-01-15' 的最近 snapshot-id
+  → 使用该 snapshot 的 manifest-list 读取该时间点的数据
+```
+
+#### 12.15.5 Version Rollback — 版本回滚
+
+**用户体验**: 允许用户将表快速重置到一个已知的良好状态。
+
+**元数据实现原理**:
+
+1. **回滚 = 修改 current-snapshot-id**: 回滚操作本质上只需将 `TableMetadata.currentSnapshotId` 指向一个历史快照 ID, 并更新 `refs.main` 的 `snapshot-id`。
+
+2. **原子性保证**: 回滚通过 `TableOperations.commit()` 提交, 遵循标准的乐观并发控制。整个过程只写一个新的 metadata JSON 文件, 修改的就是 `current-snapshot-id` 和 `refs`。
+
+3. **数据文件不变**: 回滚不删除、不移动任何数据文件。旧快照引用的 Manifest List 和数据文件在存储系统中**一直存在** (只要未被 ExpireSnapshots 清理)。因此回滚是 O(1) 操作, 只涉及一次元数据文件写入。
+
+4. **与快照保留策略的关系**: `SnapshotRef.minSnapshotsToKeep` 和 `maxSnapshotAgeMs` 控制了可以回滚到多远的历史。如果快照已过期并被清理, 则无法回滚到该时间点。
+
+```
+回滚前:
+  metadata-v5.json → current-snapshot-id: snap-5 (有问题的数据)
+
+回滚操作: ROLLBACK TO SNAPSHOT snap-3
+
+回滚后:
+  metadata-v6.json → current-snapshot-id: snap-3 (良好的状态)
+  → snap-4, snap-5 的数据文件仍在磁盘上
+  → 但当前查询只看到 snap-3 的数据
+  → 后续 ExpireSnapshots 可以清理 snap-4, snap-5
+```
+
+---
+
+<a id="12-16"></a>
+### 12.16 元数据层级关系总图
+
+```
++-----------------------------------------------------------------------+
+|                         TableMetadata (JSON)                          |
+|  format-version, uuid, location, properties, current-snapshot-id      |
+|-----------------------------------------------------------------------|
+|  schemas[]          | partition-specs[]    | sort-orders[]             |
+|  (Schema 演化历史)  | (分区规范演化历史)   | (排序规范演化历史)        |
+|-----------------------------------------------------------------------|
+|  refs{}                                                               |
+|  (branch/tag → snapshot-id 映射)                                      |
+|-----------------------------------------------------------------------|
+|  statistics[]                | partition-statistics[]                  |
+|  (Puffin 统计文件)           | (分区统计文件)                          |
+|-----------------------------------------------------------------------|
+|  snapshot-log[]              | metadata-log[]                          |
+|  (快照变更历史)              | (元数据文件变更历史)                    |
+|-----------------------------------------------------------------------|
+|  snapshots[]                                                          |
+|  +---------------------------------------------------------------+   |
+|  | Snapshot                                                       |   |
+|  | snapshot-id, parent-snapshot-id, sequence-number, timestamp-ms |   |
+|  | operation, summary{}, schema-id, first-row-id, added-rows     |   |
+|  | manifest-list → 指向 Manifest List 文件                       |   |
+|  +---------------------------------------------------------------+   |
++-----------------------------------------------------------------------+
+          |
+          | manifest-list (Avro 文件路径)
+          v
++-----------------------------------------------------------------------+
+|                    Manifest List (Avro 文件)                          |
+|  每行一个 ManifestFile 记录                                           |
+|-----------------------------------------------------------------------|
+|  ManifestFile                                                         |
+|  +---------------------------------------------------------------+   |
+|  | manifest_path, manifest_length, partition_spec_id              |   |
+|  | content (DATA/DELETES), sequence_number, min_sequence_number   |   |
+|  | added_snapshot_id                                              |   |
+|  | added_files_count, existing_files_count, deleted_files_count   |   |
+|  | added_rows_count, existing_rows_count, deleted_rows_count     |   |
+|  | partitions[] (PartitionFieldSummary) ← 第一层剪枝             |   |
+|  |   contains_null, contains_nan, lower_bound, upper_bound       |   |
+|  +---------------------------------------------------------------+   |
++-----------------------------------------------------------------------+
+          |
+          | manifest_path (Avro 文件路径)
+          v
++-----------------------------------------------------------------------+
+|                    Manifest (Avro 文件)                               |
+|  每行一个 ManifestEntry 记录                                          |
+|-----------------------------------------------------------------------|
+|  ManifestEntry                                                        |
+|  +---------------------------------------------------------------+   |
+|  | status (EXISTING=0 / ADDED=1 / DELETED=2)                     |   |
+|  | snapshot_id, sequence_number, file_sequence_number             |   |
+|  |                                                               |   |
+|  | data_file (ContentFile):                                       |   |
+|  |   content, file_path, file_format, partition                  |   |
+|  |   record_count, file_size_in_bytes                            |   |
+|  |   column_sizes, value_counts, null_value_counts               |   |
+|  |   nan_value_counts                                            |   |
+|  |   lower_bounds, upper_bounds  ← 第二层剪枝                   |   |
+|  |   split_offsets, equality_ids, sort_order_id, spec_id         |   |
+|  |   first_row_id (V3+)                                          |   |
+|  |   referenced_data_file, content_offset (V3+ DV)               |   |
+|  +---------------------------------------------------------------+   |
++-----------------------------------------------------------------------+
+          |
+          | file_path
+          v
++-----------------------------------------------------------------------+
+|                实际数据文件 (Parquet / ORC / Avro)                    |
++-----------------------------------------------------------------------+
+```

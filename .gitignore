@@ -75,3 +75,5 @@ derby.log
 
 # sdkman
 .sdkmanrc
+
+.claude
