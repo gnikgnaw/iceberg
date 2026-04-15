@@ -1203,9 +1203,10 @@ public Type primitive(PrimitiveType primitive) {
 // Date -> DateType
 // Time -> TimeType
 // Timestamp (microseconds) -> TimestampType (with/without zone)
-// Int (signed, bit_width < 32) -> IntegerType
-// Int (signed, bit_width == 32) -> IntegerType
-// Int (unsigned or bit_width > 32) -> LongType
+// Int (bit_width < 32, signed or unsigned) -> IntegerType
+// Int (bit_width == 32, signed) -> IntegerType
+// Int (bit_width == 32, unsigned) -> LongType
+// Int (bit_width > 32) -> LongType
 // Json -> StringType
 // Bson -> BinaryType
 ```

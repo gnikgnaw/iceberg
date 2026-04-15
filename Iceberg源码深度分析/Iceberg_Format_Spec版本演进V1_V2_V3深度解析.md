@@ -202,18 +202,18 @@ Preconditions.checkArgument(
 快照（Snapshot）是 Iceberg 表在某个时间点的完整数据状态。V1 的 Snapshot 接口定义在 `api/src/main/java/org/apache/iceberg/Snapshot.java`：
 
 ```java
-// api/src/main/java/org/apache/iceberg/Snapshot.java:34-50
+// api/src/main/java/org/apache/iceberg/Snapshot.java（关键方法节选，分布在第34-181行）
 public interface Snapshot extends Serializable {
-  long sequenceNumber();     // V2 引入，V1 默认为 0
-  long snapshotId();
-  Long parentId();
-  long timestampMillis();
-  List<ManifestFile> allManifests(FileIO io);
-  List<ManifestFile> dataManifests(FileIO io);
-  List<ManifestFile> deleteManifests(FileIO io);  // V2 引入
-  String operation();
-  Map<String, String> summary();
-  String manifestListLocation();
+  long sequenceNumber();     // 第42行，V2 引入，V1 默认为 0
+  long snapshotId();         // 第45行
+  Long parentId();           // 第56行
+  long timestampMillis();    // 第65行
+  List<ManifestFile> allManifests(FileIO io);   // 第73行
+  List<ManifestFile> dataManifests(FileIO io);  // 第81行
+  List<ManifestFile> deleteManifests(FileIO io);  // 第89行，V2 引入
+  String operation();        // 第97行
+  Map<String, String> summary();  // 第104行
+  String manifestListLocation();  // 第171行
   // ...
 }
 ```

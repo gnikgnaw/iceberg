@@ -208,16 +208,19 @@ public boolean satisfiesOrderOf(Transform<?, ?> other) {
 **`VoidTransform`**（`api/src/main/java/org/apache/iceberg/transforms/VoidTransform.java`）是一个特殊的 transform：
 
 ```java
-// VoidTransform.java 第28-46行
+// VoidTransform.java（关键方法节选，分布在第28-93行）
 class VoidTransform<S> implements Transform<S, Void> {
+  // 第61行
   @Override
   public Void apply(Object value) { return null; }
 
+  // 第86行
   @Override
   public UnboundPredicate<Void> project(String name, BoundPredicate<S> predicate) {
     return null;  // 总是返回 null，不参与分区过滤
   }
 
+  // 第91行
   @Override
   public boolean isVoid() { return true; }
 }

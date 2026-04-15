@@ -212,7 +212,7 @@ public interface View {
 **设计特点**：
 
 1. **default 方法的防御性设计**：`location()`、`replaceVersion()`、`updateLocation()`、`uuid()`、`sqlFor()` 这五个方法都使用了 default 实现，默认抛出 `UnsupportedOperationException`。这种设计允许不同的实现选择性地支持这些功能
-2. **读写分离**：读取方法（`schema()`、`currentVersion()` 等）是必须实现的，而写入方法（`updateProperties()`、`replaceVersion()` 等）使用 default 来提供灵活性
+2. **读写分离**：读取方法（`schema()`、`currentVersion()` 等）是必须实现的抽象方法；`updateProperties()` 也是抽象方法（必须由实现类覆盖），而 `replaceVersion()`、`updateLocation()` 等使用 default 实现提供灵活性
 3. **版本感知**：通过 `versions()`、`version(int)`、`history()` 三个方法提供完整的版本浏览能力
 
 ### 2.2 sqlFor 方言解析机制

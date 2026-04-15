@@ -379,7 +379,7 @@ private Pair<List<ManifestFile>, Set<Long>> validationHistory(
 检测是否有并发事务在同一范围内新增了数据文件：
 
 ```java
-// 文件：core/src/main/java/org/apache/iceberg/MergingSnapshotProducer.java，第 359-408 行
+// 文件：core/src/main/java/org/apache/iceberg/MergingSnapshotProducer.java，第 387-408 行
 protected void validateAddedDataFiles(
     TableMetadata base, Long startingSnapshotId,
     Expression conflictDetectionFilter, Snapshot parent) {

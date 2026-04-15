@@ -285,6 +285,10 @@ private boolean eval(ContentFile<?> file) {
   if (file.recordCount() == 0) {
     return ROWS_CANNOT_MATCH;
   }
+  // Avro 兼容性检查：旧版 Avro 文件可能返回负数 recordCount（第 95-100 行）
+  if (file.recordCount() < 0) {
+    return ROWS_MIGHT_MATCH;
+  }
   this.valueCounts = file.valueCounts();
   this.nullCounts = file.nullValueCounts();
   this.nanCounts = file.nanValueCounts();
@@ -642,7 +646,7 @@ private Result doExecute() {
 }
 ```
 
-写入过程（第 111-120 行）：
+写入过程（第 111-126 行）：
 
 ```java
 private StatisticsFile writeStatsFile(List<Blob> blobs) {
@@ -652,8 +656,8 @@ private StatisticsFile writeStatsFile(List<Blob> blobs) {
     writer.finish();
     return new GenericStatisticsFile(
         snapshotId(), outputFile.location(),
-        writer.fileSize(), writer.footerSize(), writer.writtenBlobsMetadata().stream()
-            .map(/* ... */).collect(Collectors.toList()));
+        writer.fileSize(), writer.footerSize(),
+        GenericBlobMetadata.from(writer.writtenBlobsMetadata()));
   }
 }
 ```
@@ -755,7 +759,7 @@ public DeleteFile[] filter(long seq) {
 }
 ```
 
-核心原则：**只有序列号 >= 数据文件序列号的删除文件才会被应用**。这是 Iceberg MVCC（Multi-Version Concurrency Control）的基础。
+核心原则：**对于 Position Delete，只有序列号 >= 数据文件序列号的删除文件才会被应用；对于 Equality Delete，使用 `applySequenceNumber = dataSequenceNumber - 1`，即序列号 >= (数据文件序列号 - 1) 的等值删除文件才会被应用**。这种差异确保了与数据文件在同一提交中写入的等值删除也能正确生效。这是 Iceberg MVCC（Multi-Version Concurrency Control）的基础。
 
 ### 7.5 等值删除的范围检查优化
 

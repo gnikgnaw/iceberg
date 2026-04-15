@@ -322,6 +322,8 @@ public static Catalog loadCatalog(
 
 ```java
 // HiveCatalog.java 第77-78行
+// 注意：HiveCatalog 实现的是 Hadoop 原生的 org.apache.hadoop.conf.Configurable，
+// 而非 Iceberg 的 org.apache.iceberg.hadoop.Configurable<Object>
 public class HiveCatalog extends BaseMetastoreViewCatalog
     implements SupportsNamespaces, Configurable {
 ```
