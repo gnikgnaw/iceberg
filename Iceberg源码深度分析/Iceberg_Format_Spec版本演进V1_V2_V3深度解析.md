@@ -547,7 +547,7 @@ V2 引入了两种行级删除机制：
 |---------------|------|------|
 | `2147483546 file_path` | string | 数据文件的完整 URI |
 | `2147483545 pos` | long | 被删除行在数据文件中的序号位置（从 0 开始） |
-| `2147483544 row` | required struct<...> | 可选的被删除行的值 |
+| `2147483544 row` | optional struct<...> | 可选的被删除行的值（可省略，仅用于 merge-on-read 优化） |
 
 Position Delete 文件的行必须按 `file_path` 然后 `pos` 排序，以优化读取时的过滤性能。
 
@@ -791,16 +791,24 @@ Deletion Vector 是 V3 最重要的变更之一，它用一种更高效的位图
 // core/src/main/java/org/apache/iceberg/DeletionVector.java:29-64
 interface DeletionVector {
   Types.NestedField LOCATION =
-      Types.NestedField.required(155, "location", Types.StringType.get(),
+      Types.NestedField.required(
+          155, "location", Types.StringType.get(),
           "Location of the file containing the DV");
   Types.NestedField OFFSET =
-      Types.NestedField.required(144, "offset", Types.LongType.get(),
+      Types.NestedField.required(
+          144, "offset", Types.LongType.get(),
           "Offset in the file where the DV content starts");
   Types.NestedField SIZE_IN_BYTES =
-      Types.NestedField.required(145, "size_in_bytes", Types.LongType.get(),
+      Types.NestedField.required(
+          145,
+          "size_in_bytes",
+          Types.LongType.get(),
           "Length of the referenced DV content stored in the file");
   Types.NestedField CARDINALITY =
-      Types.NestedField.required(156, "cardinality", Types.LongType.get(),
+      Types.NestedField.required(
+          156,
+          "cardinality",
+          Types.LongType.get(),
           "Number of set bits (deleted rows) in the vector");
 
   static Types.StructType schema() {
@@ -1429,7 +1437,7 @@ static final Schema MANIFEST_LIST_SCHEMA =
 | `value_counts` (109) | optional | optional | optional |
 | `null_value_counts` (110) | optional | optional | optional |
 | `nan_value_counts` (137) | optional | optional | optional |
-| `distinct_counts` (111) | optional | 废弃 | 废弃 |
+| `distinct_counts` (111) | 规范定义但实现未写入 | 废弃 | 废弃 |
 | `lower_bounds` (125) | optional | optional | optional |
 | `upper_bounds` (128) | optional | optional | optional |
 | `key_metadata` (131) | optional | optional | optional |
