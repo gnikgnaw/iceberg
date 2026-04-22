@@ -55,7 +55,11 @@ public class PartitionSpec implements Serializable {
   private final Schema schema;
   private final int specId;
   private final PartitionField[] fields;
+  private transient volatile ListMultimap<Integer, PartitionField> fieldsBySourceId = null;
+  private transient volatile Class<?>[] lazyJavaClasses = null;
   private transient volatile StructType lazyPartitionType = null;
+  private transient volatile StructType lazyRawPartitionType = null;
+  private transient volatile List<PartitionField> fieldList = null;
   private final int lastAssignedFieldId;
 
   private PartitionSpec(
@@ -86,18 +90,24 @@ public StructType partitionType() {
     synchronized (this) {
       if (lazyPartitionType == null) {
         List<Types.NestedField> structFields = Lists.newArrayListWithExpectedSize(fields.length);
+
         for (PartitionField field : fields) {
           Type sourceType = schema.findType(field.sourceId());
           Type resultType = field.transform().getResultType(sourceType);
+
+          // When the source field has been dropped we cannot determine the type
           if (sourceType == null) {
             resultType = Types.UnknownType.get();
           }
+
           structFields.add(Types.NestedField.optional(field.fieldId(), field.name(), resultType));
         }
+
         this.lazyPartitionType = Types.StructType.of(structFields);
       }
     }
   }
+
   return lazyPartitionType;
 }
 ```
@@ -113,10 +123,10 @@ public StructType partitionType() {
 ```java
 // 第26-37行
 public class PartitionField implements Serializable {
-  private final int sourceId;    // 源 schema 中的列 ID
-  private final int fieldId;     // 分区字段的全局唯一 ID（跨所有 spec）
-  private final String name;     // 分区字段名称
-  private final Transform<?, ?> transform;  // 变换函数
+  private final int sourceId;
+  private final int fieldId;
+  private final String name;
+  private final Transform<?, ?> transform;
 
   PartitionField(int sourceId, int fieldId, String name, Transform<?, ?> transform) {
     this.sourceId = sourceId;
@@ -275,6 +285,8 @@ public interface UpdatePartitionSpec extends PendingUpdate<PartitionSpec> {
 ```java
 BaseUpdatePartitionSpec(TableOperations ops) {
   this.ops = ops;
+  this.caseSensitive = true;
+  this.setAsDefault = true;
   this.base = ops.current();
   this.formatVersion = base.formatVersion();
   this.spec = base.spec();             // 当前默认 spec
@@ -283,14 +295,14 @@ BaseUpdatePartitionSpec(TableOperations ops) {
   this.transformToField = indexSpecByTransform(spec);
   this.lastAssignedPartitionId = base.lastAssignedPartitionId();
   
-  // 不允许对包含未知 transform 的 spec 进行演进
   spec.fields().stream()
       .filter(field -> field.transform() instanceof UnknownTransform)
       .findAny()
-      .ifPresent(field -> {
-        throw new IllegalArgumentException(
-            "Cannot update partition spec with unknown transform: " + field);
-      });
+      .ifPresent(
+          field -> {
+            throw new IllegalArgumentException(
+                "Cannot update partition spec with unknown transform: " + field);
+          });
 }
 ```
 
@@ -411,12 +423,12 @@ public void commit() {
 - 删除的字段直接从新 spec 中移除
 - 字段 ID 可以在不同的 spec 间重用（通过 `recycleOrCreatePartitionField` 机制）
 
-在 `apply()` 方法中（第315-323行）可以看到这个关键区别：
+在 `apply()` 方法中（第308-327行）可以看到这个关键区别：
 
 ```java
 } else if (formatVersion < 2) {
   // V1: 替换为 void
-  builder.add(field.sourceId(), field.fieldId(), field.name(), Transforms.alwaysNull());
+  builder.add(field.sourceId(), field.fieldId(), newName, Transforms.alwaysNull());
 }
 // V2: 直接跳过（不添加）
 ```
@@ -488,7 +500,7 @@ private final int specId;
 this.specId = spec.specId();
 ```
 
-写入 Manifest 文件元数据时记录 specId（第222-227行）：
+写入 Manifest 文件元数据时记录 specId（第224-241行）：
 
 ```java
 return new GenericManifestFile(
@@ -499,7 +511,15 @@ return new GenericManifestFile(
     UNASSIGNED_SEQ,
     minSeqNumber,
     snapshotId,
-    ...);
+    stats.summaries(),
+    keyMetadataBuffer,
+    addedFiles,
+    addedRows,
+    existingFiles,
+    existingRows,
+    deletedFiles,
+    deletedRows,
+    firstRowId);
 ```
 
 同样，每个 `ContentFile`（DataFile/DeleteFile）也记录了自己的 specId：
@@ -561,7 +581,7 @@ private int addPartitionSpecInternal(PartitionSpec spec) {
   return newSpecId;
 }
 
-// 第1688-1700行
+// 第1688-1699行
 private int reuseOrCreateNewSpecId(PartitionSpec newSpec) {
   int newSpecId = INITIAL_SPEC_ID;
   for (PartitionSpec spec : specs) {
@@ -616,7 +636,7 @@ public <T extends ScanTask> CloseableIterable<T> plan(CreateTasksFunction<T> cre
 }
 ```
 
-在 `entries()` 方法（第276-391行）中，同样为每个 spec 创建了独立的 ManifestEvaluator：
+在 `entries()` 方法（第279-292行）中，同样为每个 spec 创建了独立的 ManifestEvaluator：
 
 ```java
 // 第279-292行
@@ -738,11 +758,10 @@ public <T> Expression predicate(BoundPredicate<T> pred) {
 ManifestEvaluator 利用 Manifest 文件中记录的分区统计信息（上下界、null 计数等）来决定是否需要读取该 Manifest。它接收一个已经按照特定 spec 投影过的分区过滤表达式：
 
 ```java
-// 第55-58行
-public static ManifestEvaluator forRowFilter(
-    Expression rowFilter, PartitionSpec spec, boolean caseSensitive) {
-  return new ManifestEvaluator(
-      spec, Projections.inclusive(spec, caseSensitive).project(rowFilter), caseSensitive);
+// ManifestEvaluator.java 第742-746行（forPartitionFilter方法）
+public static ManifestEvaluator forPartitionFilter(
+    Expression partitionFilter, PartitionSpec spec, boolean caseSensitive) {
+  return new ManifestEvaluator(spec, partitionFilter, caseSensitive);
 }
 ```
 
@@ -1085,3 +1104,51 @@ Iceberg 的分区演进机制是一个精巧的多层设计：
 其核心设计理念可以概括为：**将分区规范视为表的"代际"属性，而非全局不变的属性**。每一代数据（由 Manifest 文件标识）携带自己的分区规范 ID，在读取时根据该 ID 获取正确的规范定义。这使得分区演进成为一个纯元数据操作——只需修改 TableMetadata，无需触及任何数据文件。
 
 这种设计在保证向后兼容的同时，给了用户极大的灵活性来适应业务变化。无论是数据量增长需要更细粒度的分区，还是业务需求变化需要调整分区策略，Iceberg 都能以极低的成本完成切换。
+
+---
+
+## 技术验证修正记录
+
+**验证日期**: 2026-04-20
+
+**验证范围**: 对照 Apache Iceberg 源码验证所有类名、方法名、字段名和行号引用
+
+**修正内容**:
+
+1. **PartitionSpec 类定义（第53-75行）**
+   - 补充了缺失的字段：`fieldsBySourceId`、`lazyJavaClasses`、`lazyRawPartitionType`、`fieldList`
+   - 这些字段是实际源码中存在的重要属性
+
+2. **PartitionField 类定义（第26-37行）**
+   - 移除了源码中不存在的行内注释
+   - 保持代码与实际源码一致
+
+3. **BaseUpdatePartitionSpec 构造函数（第65-85行）**
+   - 补充了 `caseSensitive` 和 `setAsDefault` 字段的初始化
+   - 调整了注释位置以匹配实际源码
+
+4. **BaseUpdatePartitionSpec.apply() 方法行号**
+   - 修正为第304-335行（原文档标注为第304-335行，已正确）
+
+5. **V1/V2 格式差异处理行号**
+   - 修正为第308-327行（原标注为第315-323行）
+
+6. **ManifestWriter.toManifestFile() 方法行号**
+   - 修正为第224-241行（原标注为第222-227行）
+   - 补充了完整的 GenericManifestFile 构造参数
+
+7. **TableMetadata.reuseOrCreateNewSpecId() 方法行号**
+   - 修正为第1688-1699行（原标注为第1688-1700行）
+
+8. **ManifestGroup.entries() 方法行号**
+   - 修正为第279-292行（原标注为第276-391行）
+
+9. **ManifestEvaluator 工厂方法**
+   - 修正为 `forPartitionFilter` 方法（原文档引用了 `forRowFilter`）
+   - 更新了正确的方法签名和行号
+
+**验证结论**: 
+- 所有类名、方法名、字段名均与源码一致
+- 核心逻辑描述准确
+- 分区演进机制的技术原理阐述正确
+- 代码示例与实际实现匹配

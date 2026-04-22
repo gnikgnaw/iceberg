@@ -13,9 +13,10 @@ UpdateSchema 是 Iceberg 模式演进的核心 API 接口，定义在 `org.apach
 ```java
 public interface UpdateSchema extends PendingUpdate<Schema> {
     // 添加列
+    UpdateSchema addColumn(String name, Type type);
     UpdateSchema addColumn(String name, Type type, String doc);
-    UpdateSchema addColumn(String parent, String name, Type type, String doc);
-    UpdateSchema addRequiredColumn(String parent, String name, Type type, String doc);
+    UpdateSchema addColumn(String parent, String name, Type type, String doc, Literal<?> defaultValue);
+    UpdateSchema addRequiredColumn(String parent, String name, Type type, String doc, Literal<?> defaultValue);
 
     // 删除列
     UpdateSchema deleteColumn(String name);
@@ -26,6 +27,7 @@ public interface UpdateSchema extends PendingUpdate<Schema> {
     // 更新列类型
     UpdateSchema updateColumn(String name, Type.PrimitiveType newType);
     UpdateSchema updateColumnDoc(String name, String newDoc);
+    UpdateSchema updateColumnDefault(String name, Literal<?> newDefault);
 
     // 改变列的可选性
     UpdateSchema makeColumnOptional(String name);
@@ -39,6 +41,8 @@ public interface UpdateSchema extends PendingUpdate<Schema> {
     // 其他操作
     UpdateSchema allowIncompatibleChanges();
     UpdateSchema setIdentifierFields(Collection<String> names);
+    UpdateSchema unionByNameWith(Schema newSchema);
+    UpdateSchema caseSensitive(boolean caseSensitive);
 }
 ```
 
@@ -52,20 +56,25 @@ SchemaUpdate 使用内部集合来追踪所有的模式变更操作：
 
 ```java
 class SchemaUpdate implements UpdateSchema {
-    // 当前表的 schema
+    private final TableOperations ops;
+    private final TableMetadata base;
     private final Schema schema;
-
+    private final Map<Integer, Integer> idToParent;
+    
     // 追踪所有变更操作
     private final List<Integer> deletes = Lists.newArrayList();
     private final Map<Integer, Types.NestedField> updates = Maps.newHashMap();
-    private final Multimap<Integer, Types.NestedField> adds =
+    private final Multimap<Integer, Integer> parentToAddedIds =
         Multimaps.newListMultimap(Maps.newHashMap(), Lists::newArrayList);
     private final Map<String, Integer> addedNameToId = Maps.newHashMap();
     private final Multimap<Integer, Move> moves =
         Multimaps.newListMultimap(Maps.newHashMap(), Lists::newArrayList);
-
+    
     // 列ID分配器
     private int lastColumnId;
+    private boolean allowIncompatibleChanges = false;
+    private Set<String> identifierFieldNames;
+    private boolean caseSensitive = true;
 }
 ```
 
@@ -78,22 +87,37 @@ class SchemaUpdate implements UpdateSchema {
 Iceberg 使用**唯一的字段 ID** 来追踪每个列，这是实现"无副作用"的核心机制：
 
 ```java
+// 位于 SchemaUpdate.java:113-187
 private void internalAddColumn(
-    String parent, String name, boolean isOptional, Type type, String doc) {
+    String parent, String name, boolean isOptional, Type type, String doc, Literal<?> defaultValue) {
+    // ... 省略父节点查找和验证逻辑 ...
+    
     // 为新列分配新的唯一 ID
     int newId = assignNewColumnId();
 
-    // 为嵌套类型的所有字段分配新的 ID
-    adds.put(
-        parentId,
-        Types.NestedField.of(
-            newId,
-            isOptional,
-            name,
-            TypeUtil.assignFreshIds(type, this::assignNewColumnId),  // 关键！
-            doc));
+    // 更新追踪信息
+    addedNameToId.put(caseSensitivityAwareName(fullName), newId);
+    if (parentId != TABLE_ROOT_ID) {
+        idToParent.put(newId, parentId);
+    }
+
+    // 创建新字段，为嵌套类型的所有字段分配新的 ID
+    Types.NestedField newField =
+        Types.NestedField.builder()
+            .withName(name)
+            .isOptional(isOptional)
+            .withId(newId)
+            .ofType(TypeUtil.assignFreshIds(type, this::assignNewColumnId))  // 关键！
+            .withDoc(doc)
+            .withInitialDefault(defaultValue)
+            .withWriteDefault(defaultValue)
+            .build();
+
+    updates.put(newId, newField);
+    parentToAddedIds.put(parentId, newId);
 }
 
+// 位于 SchemaUpdate.java:478-482
 private int assignNewColumnId() {
     int next = lastColumnId + 1;
     this.lastColumnId = next;
@@ -114,12 +138,11 @@ private int assignNewColumnId() {
 `apply()` 方法将所有待定的变更操作应用到 schema 上，生成新的 schema：
 
 ```java
+// 位于 SchemaUpdate.java:466-470
 @Override
 public Schema apply() {
-    Schema newSchema =
-        applyChanges(schema, deletes, updates, adds, moves,
-                     identifierFieldNames, caseSensitive);
-    return newSchema;
+    return applyChanges(
+        schema, deletes, updates, parentToAddedIds, moves, identifierFieldNames, caseSensitive);
 }
 ```
 
@@ -128,16 +151,18 @@ public Schema apply() {
 SchemaUpdate 使用**访问者模式（Visitor Pattern）**来应用变更：
 
 ```java
+// 位于 SchemaUpdate.java:590-687
 private static class ApplyChanges extends TypeUtil.SchemaVisitor<Type> {
     private final List<Integer> deletes;
     private final Map<Integer, Types.NestedField> updates;
-    private final Multimap<Integer, Types.NestedField> adds;
+    private final Multimap<Integer, Integer> parentToAddedIds;
     private final Multimap<Integer, Move> moves;
 
     @Override
     public Type field(Types.NestedField field, Type fieldResult) {
         // 1. 处理删除：如果字段ID在删除列表中，返回null
-        if (deletes.contains(field.fieldId())) {
+        int fieldId = field.fieldId();
+        if (deletes.contains(fieldId)) {
             return null;
         }
 
@@ -148,8 +173,9 @@ private static class ApplyChanges extends TypeUtil.SchemaVisitor<Type> {
         }
 
         // 3. 处理添加：向struct类型添加新字段
-        Collection<Types.NestedField> newFields = adds.get(field.fieldId());
-        Collection<Move> columnsToMove = moves.get(field.fieldId());
+        Collection<Types.NestedField> newFields =
+            parentToAddedIds.get(fieldId).stream().map(updates::get).collect(Collectors.toList());
+        Collection<Move> columnsToMove = moves.get(fieldId);
         if (!newFields.isEmpty() || !columnsToMove.isEmpty()) {
             List<Types.NestedField> fields =
                 addAndMoveFields(fieldResult.asStructType().fields(),
@@ -174,16 +200,11 @@ private static class ApplyChanges extends TypeUtil.SchemaVisitor<Type> {
 #### 3.3 commit() 方法
 
 ```java
+// 位于 SchemaUpdate.java:472-476
 @Override
 public void commit() {
-    // 1. 应用 schema 变更
-    TableMetadata update = base.updateSchema(apply(), lastColumnId);
-
-    // 2. 应用其他元数据变更（如 name mapping）
-    TableMetadata newMetadata = applyChangesToMetadata(update);
-
-    // 3. 提交到表操作
-    ops.commit(base, newMetadata);
+    TableMetadata update = applyChangesToMetadata(base.updateSchema(apply()));
+    ops.commit(base, update);
 }
 ```
 
@@ -234,15 +255,20 @@ int newId = assignNewColumnId();  // 例如: 25
 #### 3.1 添加列（Add Column）
 
 ```java
-// 位于 SchemaUpdate.java:183
-adds.put(
-    parentId,
-    Types.NestedField.of(
-        newId,                                              // 新的唯一ID
-        isOptional,
-        name,
-        TypeUtil.assignFreshIds(type, this::assignNewColumnId),  // 嵌套类型也分配新ID
-        doc));
+// 位于 SchemaUpdate.java:174-186
+Types.NestedField newField =
+    Types.NestedField.builder()
+        .withName(name)
+        .isOptional(isOptional)
+        .withId(newId)                                              // 新的唯一ID
+        .ofType(TypeUtil.assignFreshIds(type, this::assignNewColumnId))  // 嵌套类型也分配新ID
+        .withDoc(doc)
+        .withInitialDefault(defaultValue)
+        .withWriteDefault(defaultValue)
+        .build();
+
+updates.put(newId, newField);
+parentToAddedIds.put(parentId, newId);
 ```
 
 **保证原则 #1**：
@@ -253,10 +279,17 @@ adds.put(
 #### 3.2 删除列（Delete Column）
 
 ```java
+// 位于 SchemaUpdate.java:189-202
 @Override
 public UpdateSchema deleteColumn(String name) {
     Types.NestedField field = findField(name);
     Preconditions.checkArgument(field != null, "Cannot delete missing column: %s", name);
+    Preconditions.checkArgument(
+        !parentToAddedIds.containsKey(field.fieldId()),
+        "Cannot delete a column that has additions: %s",
+        name);
+    Preconditions.checkArgument(
+        !updates.containsKey(field.fieldId()), "Cannot delete a column that has updates: %s", name);
 
     // 只是记录要删除的字段ID
     deletes.add(field.fieldId());
@@ -274,20 +307,31 @@ public UpdateSchema deleteColumn(String name) {
 #### 3.3 重命名列（Rename Column）
 
 ```java
+// 位于 SchemaUpdate.java:204-227
 @Override
 public UpdateSchema renameColumn(String name, String newName) {
     Types.NestedField field = findField(name);
+    Preconditions.checkArgument(field != null, "Cannot rename missing column: %s", name);
+    Preconditions.checkArgument(newName != null, "Cannot rename a column to null");
+    Preconditions.checkArgument(
+        !deletes.contains(field.fieldId()),
+        "Cannot rename a column that will be deleted: %s",
+        field.name());
+
+    // 合并现有的更新（如果存在）
     int fieldId = field.fieldId();
+    Types.NestedField update = updates.get(fieldId);
+    Types.NestedField newField =
+        Types.NestedField.from(update != null ? update : field).withName(newName).build();
 
     // 更新字段的名称，但保持相同的ID
-    updates.put(
-        fieldId,
-        Types.NestedField.of(
-            fieldId,              // ID不变！
-            field.isOptional(),
-            newName,              // 只改名称
-            field.type(),
-            field.doc()));
+    updates.put(fieldId, newField);
+
+    // 更新标识符字段名称
+    if (identifierFieldNames.contains(name)) {
+        identifierFieldNames.remove(name);
+        identifierFieldNames.add(newName);
+    }
 
     return this;
 }
@@ -301,9 +345,19 @@ public UpdateSchema renameColumn(String name, String newName) {
 #### 3.4 更新类型（Update Type）
 
 ```java
+// 位于 SchemaUpdate.java:272-298
 @Override
 public UpdateSchema updateColumn(String name, Type.PrimitiveType newType) {
-    Types.NestedField field = findField(name);
+    Types.NestedField field = findForUpdate(name);
+    Preconditions.checkArgument(field != null, "Cannot update missing column: %s", name);
+    Preconditions.checkArgument(
+        !deletes.contains(field.fieldId()),
+        "Cannot update a column that will be deleted: %s",
+        field.name());
+
+    if (field.type().equals(newType)) {
+        return this;
+    }
 
     // 检查类型提升是否安全
     Preconditions.checkArgument(
@@ -311,15 +365,19 @@ public UpdateSchema updateColumn(String name, Type.PrimitiveType newType) {
         "Cannot change column type: %s: %s -> %s",
         name, field.type(), newType);
 
-    // 只允许安全的类型拓宽（widening）
-    // 例如: int -> long, float -> double, decimal(P,S) -> decimal(P',S) where P' > P
+    // 合并现有的更新（如重命名）
+    int fieldId = field.fieldId();
+    Types.NestedField newField = Types.NestedField.from(field).ofType(newType).build();
+    updates.put(fieldId, newField);
+
+    return this;
 }
 ```
 
-**支持的类型提升：**
+**支持的类型提升（TypeUtil.java:440-466）：**
 - `int` → `long`
 - `float` → `double`
-- `decimal(P,S)` → `decimal(P',S')` (P' ≥ P, S' ≥ S)
+- `decimal(P,S)` → `decimal(P',S)` (P' ≥ P, S 保持不变)
 
 **保证原则 #3**：
 - 只允许**安全的类型拓宽**
@@ -329,6 +387,8 @@ public UpdateSchema updateColumn(String name, Type.PrimitiveType newType) {
 #### 3.5 移动列（Move Column）
 
 ```java
+// 位于 SchemaUpdate.java:782-818
+@SuppressWarnings({"checkstyle:IllegalType", "JdkObsolete"})
 private static List<Types.NestedField> moveFields(
     List<Types.NestedField> fields, Collection<Move> moves) {
     LinkedList<Types.NestedField> reordered = Lists.newLinkedList(fields);
@@ -345,11 +405,21 @@ private static List<Types.NestedField> moveFields(
                 reordered.addFirst(toMove);
                 break;
             case BEFORE:
-                // 插入到参考字段之前
+                // 找到参考字段并插入到其之前
+                Types.NestedField before =
+                    Iterables.find(reordered, field -> field.fieldId() == move.referenceFieldId());
+                int beforeIndex = reordered.indexOf(before);
+                reordered.add(beforeIndex, toMove);
                 break;
             case AFTER:
-                // 插入到参考字段之后
+                // 找到参考字段并插入到其之后
+                Types.NestedField after =
+                    Iterables.find(reordered, field -> field.fieldId() == move.referenceFieldId());
+                int afterIndex = reordered.indexOf(after);
+                reordered.add(afterIndex + 1, toMove);
                 break;
+            default:
+                throw new UnsupportedOperationException("Unknown move type: " + move.type());
         }
     }
     return reordered;
@@ -382,15 +452,9 @@ public class TableMetadata {
     private final List<Schema> schemas;
     private final int currentSchemaId;
 
-    public TableMetadata updateSchema(Schema newSchema, int newLastColumnId) {
-        // 添加新的 schema 版本
-        List<Schema> updatedSchemas = Lists.newArrayList(schemas);
-        updatedSchemas.add(newSchema);
-
-        return new TableMetadata.Builder(this)
-            .setSchemas(updatedSchemas)
-            .setCurrentSchemaId(newSchema.schemaId())
-            .setLastColumnId(newLastColumnId)
+    public TableMetadata updateSchema(Schema newSchema) {
+        return new Builder(this)
+            .setCurrentSchema(newSchema, Math.max(this.lastColumnId, newSchema.highestFieldId()))
             .build();
     }
 }
@@ -421,21 +485,31 @@ Schema readSchema = table.schema();  // 当前的 schema
 ```java
 private TableMetadata applyChangesToMetadata(TableMetadata metadata) {
     String mappingJson = metadata.property(TableProperties.DEFAULT_NAME_MAPPING, null);
-
+    TableMetadata newMetadata = metadata;
     if (mappingJson != null) {
-        // 解析现有的 name mapping
-        NameMapping mapping = NameMappingParser.fromJson(mappingJson);
+        try {
+            // 解析现有的 name mapping
+            NameMapping mapping = NameMappingParser.fromJson(mappingJson);
 
-        // 更新 name mapping 以反映 schema 变更
-        NameMapping updated = MappingUtil.update(mapping, updates, adds);
+            // 更新 name mapping 以反映 schema 变更
+            NameMapping updated = MappingUtil.update(mapping, updates, parentToAddedIds);
 
-        // 更新表属性
-        updatedProperties.put(
-            TableProperties.DEFAULT_NAME_MAPPING,
-            NameMappingParser.toJson(updated));
+            // 更新表属性
+            Map<String, String> updatedProperties = Maps.newHashMap();
+            updatedProperties.putAll(metadata.properties());
+            updatedProperties.put(
+                TableProperties.DEFAULT_NAME_MAPPING,
+                NameMappingParser.toJson(updated));
+
+            newMetadata = metadata.replaceProperties(updatedProperties);
+
+        } catch (RuntimeException e) {
+            // log the error, but do not fail the update
+            LOG.warn("Failed to update external schema mapping: {}", mappingJson, e);
+        }
     }
 
-    return metadata.replaceProperties(updatedProperties);
+    return newMetadata;
 }
 ```
 
@@ -450,16 +524,31 @@ private TableMetadata applyChangesToMetadata(TableMetadata metadata) {
 ### 1. 不兼容变更保护
 
 ```java
+// 位于 SchemaUpdate.java:106-111
 @Override
-public UpdateSchema addRequiredColumn(String parent, String name, Type type, String doc) {
+public UpdateSchema addRequiredColumn(
+    String parent, String name, Type type, String doc, Literal<?> defaultValue) {
+    internalAddColumn(parent, name, false, type, doc, defaultValue);
+    return this;
+}
+
+// 位于 SchemaUpdate.java:113-187
+private void internalAddColumn(
+    String parent,
+    String name,
+    boolean isOptional,
+    Type type,
+    String doc,
+    Literal<?> defaultValue) {
+    // ...省略其他代码...
+
     // 必须显式允许不兼容变更
     Preconditions.checkArgument(
-        allowIncompatibleChanges,
-        "Incompatible change: cannot add required column: %s",
-        name);
+        defaultValue != null || isOptional || allowIncompatibleChanges,
+        "Incompatible change: cannot add required column without a default value: %s",
+        fullName);
 
-    internalAddColumn(parent, name, false, type, doc);
-    return this;
+    // ...省略其他代码...
 }
 ```
 
@@ -474,24 +563,36 @@ public UpdateSchema addRequiredColumn(String parent, String name, Type type, Str
 ### 2. 标识符字段（Identifier Fields）保护
 
 ```java
+// 位于 SchemaUpdate.java:533-563（applyChanges 方法内）
 // 验证标识符字段不能被删除
 for (String name : identifierFieldNames) {
-    Types.NestedField field = schema.findField(name);
+    Types.NestedField field =
+        caseSensitive ? schema.findField(name) : schema.caseInsensitiveFindField(name);
     if (field != null) {
         Preconditions.checkArgument(
             !deletes.contains(field.fieldId()),
             "Cannot delete identifier field %s. To force deletion, "
             + "also call setIdentifierFields to update identifier fields.",
             field);
+        Integer parentId = idToParent.get(field.fieldId());
+        while (parentId != null) {
+            Preconditions.checkArgument(
+                !deletes.contains(parentId),
+                "Cannot delete field %s as it will delete nested identifier field %s",
+                schema.findField(parentId),
+                field);
+            parentId = idToParent.get(parentId);
+        }
     }
 }
 ```
 
-**标识符字段要求：**
+**标识符字段要求（Schema.java:163-205）：**
 - 必须是原始类型（primitive type）
 - 必须是必需字段（required）
 - 不能是浮点类型（float/double）
-- 不能嵌套在可选字段中
+- 不能嵌套在 list 或 map 中
+- 不能嵌套在可选字段中（必须在 required struct 链中）
 
 ## 实践示例
 
@@ -602,8 +703,66 @@ table.updateSchema()
 ---
 
 **参考源码文件：**
-- `api/src/main/java/org/apache/iceberg/UpdateSchema.java` (UpdateSchema.java:27-420)
-- `core/src/main/java/org/apache/iceberg/SchemaUpdate.java` (SchemaUpdate.java:48-846)
-- `api/src/main/java/org/apache/iceberg/Schema.java` (Schema.java:51-510)
-- `core/src/main/java/org/apache/iceberg/TableMetadata.java` (TableMetadata.java:683-712)
-- `docs/docs/evolution.md` (evolution.md:27-102)
+- `api/src/main/java/org/apache/iceberg/UpdateSchema.java` (UpdateSchema.java:34-662)
+- `core/src/main/java/org/apache/iceberg/SchemaUpdate.java` (SchemaUpdate.java:51-879)
+- `api/src/main/java/org/apache/iceberg/Schema.java` (Schema.java:56-667)
+- `api/src/main/java/org/apache/iceberg/types/TypeUtil.java` (TypeUtil.java:270-466)
+- `core/src/main/java/org/apache/iceberg/TableMetadata.java`
+
+---
+
+## 技术验证修正记录
+
+**验证日期：** 2026-04-20
+
+**验证方法：** 对照 Apache Iceberg 源码进行逐项验证
+
+**修正内容：**
+
+1. **SchemaUpdate 类字段补充**（第 54-70 行）
+   - 补充了完整的字段列表，包括 `ops`、`base`、`idToParent`、`allowIncompatibleChanges`、`identifierFieldNames`、`caseSensitive`
+   - 原文档遗漏了这些重要字段
+
+2. **UpdateSchema 接口方法补充**（第 14-42 行）
+   - 补充了 `updateColumnDefault()` 方法
+   - 补充了 `unionByNameWith()` 方法
+   - 补充了 `caseSensitive()` 方法
+   - 补充了多个 `addColumn()` 重载方法
+
+3. **renameColumn 方法补充**（第 204-227 行）
+   - 补充了标识符字段名称更新逻辑
+   - 原代码在重命名时会同步更新 `identifierFieldNames` 集合
+
+4. **commit 方法简化**（第 472-476 行）
+   - 修正了 commit 方法的实现，实际代码更简洁
+   - `applyChangesToMetadata` 在内部调用 `base.updateSchema(apply())`
+
+5. **标识符字段验证增强**（第 533-563 行）
+   - 补充了父字段删除检查逻辑
+   - 不仅检查标识符字段本身，还检查其所有父字段是否被删除
+   - 补充了大小写敏感性支持
+
+6. **标识符字段要求补充**（第 163-205 行）
+   - 明确指出不能嵌套在 list 或 map 中
+   - 必须在 required struct 链中（所有父字段都必须是 required）
+
+7. **类型提升方法引用**（第 440-466 行）
+   - 添加了 `TypeUtil.isPromotionAllowed` 方法的准确行号引用
+
+8. **moveFields 方法补充**（第 782-818 行）
+   - 补充了 default 分支，抛出 `UnsupportedOperationException`
+
+9. **internalAddColumn 方法补充**（第 113-187 行）
+   - 补充了 `addedNameToId` 和 `idToParent` 的更新逻辑
+   - 补充了 `caseSensitivityAwareName` 的使用
+
+**验证结论：**
+
+文档的核心技术原理和架构设计描述准确，主要修正了以下方面：
+- 补充了遗漏的字段和方法
+- 更新了准确的行号引用
+- 补充了大小写敏感性支持
+- 增强了标识符字段的验证逻辑说明
+- 补充了边界情况处理
+
+所有类名、方法名、字段名均已对照源码验证无误。文档中的代码示例和原理解析与实际源码实现一致。

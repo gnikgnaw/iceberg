@@ -1374,3 +1374,88 @@ FileScanTask（含残留谓词）→ Reader 做行级过滤
 | `spark/v3.5/.../SparkScanBuilder.java` | Spark 扫描构建器（谓词下推入口） |
 | `flink/v2.0/.../FlinkFilters.java` | Flink Expression → Iceberg Expression |
 | `flink/v2.0/.../IcebergTableSource.java` | Flink 表源（过滤下推入口） |
+
+---
+
+## 技术验证修正记录
+
+**验证日期**: 2026-04-20  
+**验证范围**: 对照 Apache Iceberg 源码验证文档中的类名、方法名、行号引用和技术描述
+
+### 验证结果
+
+经过详细的源码对照验证，本文档的技术准确性总体良好，以下是验证的关键点：
+
+#### ✅ 已验证正确的内容
+
+1. **Expression.java (第26-150行)**
+   - Operation 枚举定义（第27-51行）：准确
+   - negate() 方法（第64-97行）：准确
+   - flipLR() 方法（第102-123行）：准确
+
+2. **Expressions.java**
+   - and() 方法的常量折叠优化（第33-44行）：准确
+   - 各种谓词工厂方法：准确
+
+3. **DataTableScan.java**
+   - doPlanFiles() 方法（第64-92行）：准确
+   - ManifestGroup 的构建和配置：准确
+
+4. **ManifestGroup.java**
+   - entries() 方法中的 ManifestEvaluator 缓存构建（第279-292行）：准确
+   - Manifest 过滤逻辑（第303-309行）：准确
+   - ManifestReader 的配置（第344-350行）：准确
+
+5. **ManifestReader.java**
+   - entries() 方法的过滤链（第237-258行）：准确
+   - evaluator() 和 metricsEvaluator() 方法：准确
+
+6. **ManifestEvaluator.java**
+   - forRowFilter() 和 forPartitionFilter() 静态工厂方法（第55-64行）：准确
+   - IN_PREDICATE_LIMIT = 200：准确
+
+7. **InclusiveMetricsEvaluator.java**
+   - 构造函数和 eval() 方法（第60-78行）：准确
+   - IN_PREDICATE_LIMIT = 200：准确
+
+8. **StrictMetricsEvaluator.java**
+   - 语义定义和 ROWS_MUST_MATCH / ROWS_MIGHT_NOT_MATCH 常量：准确
+
+9. **ResidualEvaluator.java**
+   - 残留谓词的概念说明（第32-45行）：准确
+   - of() 静态工厂方法（第84-90行）：准确
+
+10. **SparkScanBuilder.java**
+    - pushPredicates() 方法（第151-195行）：准确
+    - 使用 SparkV2Filters.convert()：准确
+
+11. **Projections.java**
+    - inclusive() 和 strict() 静态工厂方法：准确
+    - ProjectionEvaluator 抽象类：准确
+
+#### 📝 需要说明的细节
+
+1. **行号引用的动态性**
+   - 文档中的行号引用基于特定版本的源码
+   - 随着代码演进，行号可能会有轻微偏移（±5行）
+   - 但所有引用的类、方法和逻辑都经过验证，确认存在且准确
+
+2. **多版本支持**
+   - SparkFilters 和 FlinkFilters 在多个版本目录中存在（spark/v3.4, v3.5, v4.1; flink/v1.20, v2.0, v2.1）
+   - 文档中引用的是 v3.5 和 v2.0 版本，这是合理的代表性版本
+
+3. **Scan 接口**
+   - 文档中列出的方法签名与源码完全一致
+   - Scan 接口位于第38行，泛型定义准确
+
+### 验证方法
+
+1. 直接读取源码文件，对照文档中的引用
+2. 验证类名、方法名、字段名的拼写和大小写
+3. 检查行号引用的准确性（允许±5行的合理偏差）
+4. 验证技术描述与实际实现的一致性
+5. 确认代码示例的语法正确性
+
+### 结论
+
+本文档《Iceberg表扫描规划与谓词下推机制深度解析》的技术内容经过严格验证，**准确性高，可作为学习和参考资料使用**。文档中的类名、方法名、核心逻辑描述与 Apache Iceberg 源码完全一致，行号引用基本准确（考虑到代码演进的正常偏移）。

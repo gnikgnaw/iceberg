@@ -1,12 +1,13 @@
 # Iceberg字段默认值支持深度分析
 
-> **🎉 重要更新（2026-02-03）**：
+> **🎉 重要更新（2026-04-20）**：
 > 经过代码验证，**Iceberg Format V3已于2024年8月正式投入生产使用**！
 > - ✅ 自Iceberg 1.7.0版本起，V3格式可用于生产环境
-> - ✅ `SUPPORTED_TABLE_FORMAT_VERSION = 3`（自2024年8月1日起）
+> - ✅ `SUPPORTED_TABLE_FORMAT_VERSION = 4`（当前源码支持到V4，V4仍在开发中）
+> - ✅ `DEFAULT_TABLE_FORMAT_VERSION = 2`（默认创建V2表）
 > - ✅ 字段默认值功能已在主流引擎中实现（**仅读取端**）
 >
-> **⚠️ 重要更正（2026-02-03）**：
+> **⚠️ 重要更正（2026-04-20）**：
 > - ❌ **Flink和Spark写入时都不支持write-default自动填充**
 > - ✅ 只有**读取端**支持initial-default填充
 > - 详见：《Flink与Spark写入默认值支持分析.md》

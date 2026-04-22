@@ -26,7 +26,7 @@ Spark 执行 `INSERT OVERWRITE` 时，根据覆写模式走不同路径：
 INSERT OVERWRITE table SELECT ...  (动态分区模式)
 ```
 
-**源码位置**: `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java:308-344`
+**源码位置**: `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java:310-345`
 
 ```java
 private class DynamicOverwrite extends BaseBatchWrite {
@@ -49,7 +49,7 @@ private class DynamicOverwrite extends BaseBatchWrite {
 INSERT OVERWRITE table PARTITION(dt='2024-01-01') SELECT ...
 ```
 
-**源码位置**: `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java:346-386`
+**源码位置**: `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java:348-388`
 
 ```java
 private class OverwriteByFilter extends BaseBatchWrite {
@@ -135,6 +135,8 @@ this.deleteFilterManager = new DeleteFileFilterManager();
 
 #### 4.1 dropPartition — 动态覆写的核心
 
+**源码位置**: `core/src/main/java/org/apache/iceberg/MergingSnapshotProducer.java:199-203`
+
 ```java
 protected void dropPartition(int specId, StructLike partition) {
     // dropping the data in a partition also drops all deletes in the partition
@@ -146,12 +148,14 @@ protected void dropPartition(int specId, StructLike partition) {
 
 #### 4.2 deleteByRowFilter — 静态覆写/非分区表的核心
 
+**源码位置**: `core/src/main/java/org/apache/iceberg/MergingSnapshotProducer.java:190-196`
+
 ```java
 protected void deleteByRowFilter(Expression expr) {
     this.deleteExpression = expr;
     filterManager.deleteByRowFilter(expr);
-    // if a delete file matches the row filter, then it can be deleted
-    // because the rows will also be deleted
+    // if a delete file matches the row filter, then it can be deleted because the rows will also be
+    // deleted
     //（注释原文：如果 delete file 匹配行过滤条件，它也可以被删除，
     //  因为它所删除的行也会被一起删除）
     deleteFilterManager.deleteByRowFilter(expr);
@@ -282,9 +286,9 @@ if (dataSpec().isUnpartitioned()) {
 2. **避免性能退化**：如果保留这些 delete 文件，读取时引擎仍然需要加载并应用这些 delete 文件做行级过滤。但新写入的数据文件中根本不包含这些"被删除"的行，这些过滤操作纯属浪费。
 
 3. **源码注释佐证**：
-   - `MergingSnapshotProducer.java:183-185` 原文注释：
+   - `MergingSnapshotProducer.java:193-194` 原文注释：
      > if a delete file matches the row filter, then it can be deleted because the rows will also be deleted
-   - `MergingSnapshotProducer.java:189-190` 原文注释：
+   - `MergingSnapshotProducer.java:200` 原文注释：
      > dropping the data in a partition also drops all deletes in the partition
 
 ---
@@ -311,7 +315,7 @@ if (dataSpec().isUnpartitioned()) {
 
 ### 源码：SnapshotProducer.java 中的 updateTotal 方法
 
-**源码位置**: `core/src/main/java/org/apache/iceberg/SnapshotProducer.java:840-870`
+**源码位置**: `core/src/main/java/org/apache/iceberg/SnapshotProducer.java:901-931`
 
 `total-*` 系列指标是**基于上一个快照的 total 值增量计算**的：
 
@@ -325,20 +329,25 @@ private static void updateTotal(
     String deletedProperty) {    // e.g. "removed-delete-files"
   String totalStr = previousSummary.get(totalProperty);
   if (totalStr != null) {
-    long newTotal = Long.parseLong(totalStr);
+    try {
+      long newTotal = Long.parseLong(totalStr);
 
-    String addedStr = currentSummary.get(addedProperty);
-    if (newTotal >= 0 && addedStr != null) {
-      newTotal += Long.parseLong(addedStr);     // ← 加上新增的
-    }
+      String addedStr = currentSummary.get(addedProperty);
+      if (newTotal >= 0 && addedStr != null) {
+        newTotal += Long.parseLong(addedStr);     // ← 加上新增的
+      }
 
-    String deletedStr = currentSummary.get(deletedProperty);
-    if (newTotal >= 0 && deletedStr != null) {
-      newTotal -= Long.parseLong(deletedStr);   // ← 减去移除的
-    }
+      String deletedStr = currentSummary.get(deletedProperty);
+      if (newTotal >= 0 && deletedStr != null) {
+        newTotal -= Long.parseLong(deletedStr);   // ← 减去移除的
+      }
 
-    if (newTotal >= 0) {
-      summaryBuilder.put(totalProperty, String.valueOf(newTotal));
+      if (newTotal >= 0) {
+        summaryBuilder.put(totalProperty, String.valueOf(newTotal));
+      }
+
+    } catch (NumberFormatException e) {
+      // ignore and do not add total
     }
   }
 }
@@ -350,7 +359,7 @@ private static void updateTotal(
 新快照的 total = 上一快照的 total + 本次 added - 本次 removed
 ```
 
-具体调用链（`SnapshotProducer.java:420-440`）：
+具体调用链（`SnapshotProducer.java:422-442`）：
 
 ```java
 // total-delete-files = previous.total-delete-files + added-delete-files - removed-delete-files
@@ -359,17 +368,17 @@ updateTotal(builder, previousSummary,
     SnapshotSummary.ADDED_DELETE_FILES_PROP,
     SnapshotSummary.REMOVED_DELETE_FILES_PROP);
 
-// total-equality-deletes = previous.total-equality-deletes + added-equality-deletes - removed-equality-deletes
-updateTotal(builder, previousSummary,
-    SnapshotSummary.TOTAL_EQ_DELETES_PROP, summary,
-    SnapshotSummary.ADDED_EQ_DELETES_PROP,
-    SnapshotSummary.REMOVED_EQ_DELETES_PROP);
-
 // total-position-deletes 同理
 updateTotal(builder, previousSummary,
     SnapshotSummary.TOTAL_POS_DELETES_PROP, summary,
     SnapshotSummary.ADDED_POS_DELETES_PROP,
     SnapshotSummary.REMOVED_POS_DELETES_PROP);
+
+// total-equality-deletes = previous.total-equality-deletes + added-equality-deletes - removed-equality-deletes
+updateTotal(builder, previousSummary,
+    SnapshotSummary.TOTAL_EQ_DELETES_PROP, summary,
+    SnapshotSummary.ADDED_EQ_DELETES_PROP,
+    SnapshotSummary.REMOVED_EQ_DELETES_PROP);
 ```
 
 ### 示例：INSERT OVERWRITE 前后的快照变化
@@ -422,13 +431,53 @@ updateTotal(builder, previousSummary,
 
 | 文件 | 关键类/方法 | 作用 |
 |------|-----------|------|
-| `SparkWrite.java:308-344` | `DynamicOverwrite.commit()` | Spark 动态覆写入口 |
-| `SparkWrite.java:346-386` | `OverwriteByFilter.commit()` | Spark 静态覆写入口 |
+| `SparkWrite.java:310-345` | `DynamicOverwrite.commit()` | Spark 动态覆写入口 |
+| `SparkWrite.java:348-388` | `OverwriteByFilter.commit()` | Spark 静态覆写入口 |
 | `BaseReplacePartitions.java:51-56` | `addFile()` → `dropPartition()` | 动态覆写：按分区替换 |
-| `BaseReplacePartitions.java:113-125` | `apply()` | 非分区表：全量替换 |
+| `BaseReplacePartitions.java:113-117` | `apply()` | 非分区表：全量替换 |
 | `BaseOverwriteFiles.java:63-66` | `overwriteByRowFilter()` | 静态覆写：按条件删除 |
-| `MergingSnapshotProducer.java:180-193` | `deleteByRowFilter()` / `dropPartition()` | **核心枢纽：同时操作两个 FilterManager** |
-| `ManifestFilterManager.java:131-144` | `deleteByRowFilter()` / `dropPartition()` | 底层 manifest 过滤逻辑 |
-| `SnapshotProducer.java:840-870` | `updateTotal()` | 快照 summary 中 total-* 指标的增量计算 |
-| `SnapshotProducer.java:420-440` | `updateTotal()` 调用处 | 计算 total-delete-files / total-equality-deletes 等 |
-| `SnapshotSummary.java:35-60` | Summary 常量定义 | 所有快照 summary 字段的 key 定义 |
+| `MergingSnapshotProducer.java:190-203` | `deleteByRowFilter()` / `dropPartition()` | **核心枢纽：同时操作两个 FilterManager** |
+| `ManifestFilterManager.java:135-147` | `deleteByRowFilter()` / `dropPartition()` | 底层 manifest 过滤逻辑 |
+| `SnapshotProducer.java:901-931` | `updateTotal()` | 快照 summary 中 total-* 指标的增量计算 |
+| `SnapshotProducer.java:422-442` | `updateTotal()` 调用处 | 计算 total-delete-files / total-equality-deletes 等 |
+| `SnapshotSummary.java:32-68` | Summary 常量定义 | 所有快照 summary 字段的 key 定义 |
+
+---
+
+## 技术验证修正记录
+
+**验证日期**: 2026-04-20
+
+**验证范围**: 对照 Apache Iceberg 源码验证所有类名、方法名、字段名和行号引用
+
+**修正内容**:
+
+1. **SparkWrite.java 行号修正**:
+   - `DynamicOverwrite.commit()`: 308-344 → **310-345**
+   - `OverwriteByFilter.commit()`: 346-386 → **348-388**
+
+2. **MergingSnapshotProducer.java 行号修正**:
+   - `deleteByRowFilter()` 方法: 180-193 → **190-196**
+   - `dropPartition()` 方法: 189-190 → **199-203**
+   - 注释行号: 183-185 → **193-194**, 189-190 → **200**
+
+3. **SnapshotProducer.java 行号修正**:
+   - `updateTotal()` 方法定义: 840-870 → **901-931**
+   - `updateTotal()` 调用处: 420-440 → **422-442**
+   - 添加了 `try-catch` 异常处理代码块（源码中存在但文档遗漏）
+
+4. **ManifestFilterManager.java 行号修正**:
+   - `deleteByRowFilter()` / `dropPartition()`: 131-144 → **135-147**
+
+5. **BaseReplacePartitions.java 行号修正**:
+   - `apply()` 方法: 113-125 → **113-117**（实际方法体更短）
+
+6. **SnapshotSummary.java 行号修正**:
+   - Summary 常量定义: 35-60 → **32-68**
+
+**验证结论**: 
+- 所有类名、方法名、字段名验证正确
+- 核心逻辑描述准确：INSERT OVERWRITE 确实会同时清理数据文件和删除文件
+- 调用链路完整且正确
+- 设计原理分析合理
+- 行号引用已全部修正为准确值

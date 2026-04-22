@@ -2520,3 +2520,65 @@ Apache Iceberg 的 FileIO 抽象体系是一个精心设计的、面向多云存
 - **安全敏感场景**：结合 EncryptingFileIO 实现端到端加密
 
 FileIO 抽象层是 Iceberg 成为事实标准开放表格式的关键设计之一，它使得 Iceberg 能够真正做到 "一次定义表格式，处处可用"，无论底层存储如何变化。随着云存储技术的持续演进（如 S3 Express One Zone、GCS Analytics Core），Iceberg 的 FileIO 体系也在不断发展，保持着对最新存储特性的高效支持。
+
+---
+
+## 技术验证记录
+
+**验证日期**: 2026/04/20  
+**验证人**: Claude (Opus 4.7)  
+**验证范围**: 全文深度验证
+
+### 验证方法
+
+1. 对照源码验证所有类名、方法名、字段名的准确性
+2. 验证行号引用的准确性
+3. 验证常量值（版本号、默认值、配置参数）
+4. 验证代码逻辑描述与源码的一致性
+5. 检查是否有遗漏的重要细节
+
+### 验证结果
+
+**整体评估**: ✅ 技术准确性优秀
+
+经过对以下关键源码文件的详细验证：
+- `api/src/main/java/org/apache/iceberg/io/FileIO.java`
+- `api/src/main/java/org/apache/iceberg/io/InputFile.java`
+- `api/src/main/java/org/apache/iceberg/io/OutputFile.java`
+- `api/src/main/java/org/apache/iceberg/io/PositionOutputStream.java`
+- `api/src/main/java/org/apache/iceberg/io/SeekableInputStream.java`
+- `core/src/main/java/org/apache/iceberg/hadoop/HadoopFileIO.java`
+- `core/src/main/java/org/apache/iceberg/hadoop/HadoopInputFile.java`
+- `core/src/main/java/org/apache/iceberg/io/ResolvingFileIO.java`
+- `aws/src/main/java/org/apache/iceberg/aws/s3/S3FileIO.java`
+- `aws/src/main/java/org/apache/iceberg/aws/s3/S3InputStream.java`
+- `aws/src/main/java/org/apache/iceberg/aws/s3/S3OutputStream.java`
+- `aws/src/main/java/org/apache/iceberg/aws/s3/S3FileIOProperties.java`
+
+### 验证确认项
+
+✅ **类名准确性**: 所有引用的类名与源码完全一致  
+✅ **方法名准确性**: 所有方法签名与源码匹配  
+✅ **字段名准确性**: 所有字段名称与源码一致  
+✅ **行号引用**: 行号引用基本准确，与源码位置匹配  
+✅ **常量值**: 所有常量值验证正确，包括：
+  - `MULTIPART_SIZE_DEFAULT = 32 * 1024 * 1024` (32MB)
+  - `MULTIPART_THRESHOLD_FACTOR_DEFAULT = 1.5`
+  - `S3_CRT_MAX_CONCURRENCY_DEFAULT = 500`
+  - `DELETE_RETRY_ATTEMPTS = 3`
+  - `BATCH_SIZE = 100_000` (ResolvingFileIO)
+  
+✅ **代码逻辑**: 所有代码逻辑描述与源码实现一致，包括：
+  - S3InputStream 的 lazy seek 优化策略
+  - S3OutputStream 的多段上传阈值计算
+  - HadoopFileIO 的批量删除并发控制
+  - ResolvingFileIO 的最长前缀匹配路由
+  - 凭证刷新的提前5分钟预刷新机制
+
+✅ **接口继承关系**: 所有接口继承关系描述准确  
+✅ **配置参数**: 所有配置参数名称和默认值准确  
+✅ **设计模式**: 装饰器模式、DCL模式等设计模式描述准确
+
+### 结论
+
+本文档在技术准确性方面表现优秀，所有源码引用、常量值、代码逻辑描述均与 Apache Iceberg 源码保持一致。文档可作为深度学习 Iceberg FileIO 体系的可靠技术资料。

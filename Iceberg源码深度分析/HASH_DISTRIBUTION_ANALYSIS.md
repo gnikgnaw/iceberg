@@ -4,13 +4,20 @@
 
 当 Apache Iceberg 的 `DistributionMode` 设置为 `HASH` 时，系统会根据表的分区键（Partition Key）对数据进行哈希分布，确保相同分区的数据被发送到同一个 Spark Task 中处理。这种分布模式适合数据在不同分区中均匀分布的场景。
 
-**核心定义** (`api/src/main/java/org/apache/iceberg/DistributionMode.java:32-33`):
+**核心定义** (`api/src/main/java/org/apache/iceberg/DistributionMode.java:39-42`):
+```java
+public enum DistributionMode {
+  NONE("none"),
+  HASH("hash"),
+  RANGE("range");
+```
+
+**注释说明** (`api/src/main/java/org/apache/iceberg/DistributionMode.java:32-33`):
 ```java
 /**
  * 2. hash: hash distribute by partition key, which is suitable for the scenarios where the rows
  * are located into different partitions evenly.
  */
-HASH("hash")
 ```
 
 ---
@@ -22,11 +29,13 @@ HASH("hash")
 ```
 User Query/Write Request
     ↓
-SparkWriteBuilder.buildWriteRequirements()
+SparkWriteBuilder.build() → writeRequirements()
     ↓
-SparkDistributionAndOrderingUtil.buildRequiredDistribution(table, DistributionMode.HASH)
+SparkWriteConf.writeRequirements()
     ↓
-Distributions.clustered(Spark3Util.toTransforms(table.spec()))
+SparkWriteUtil.writeRequirements(table, DistributionMode.HASH)
+    ↓
+SparkWriteUtil.writeDistribution() → Distributions.clustered(Spark3Util.toTransforms(table.spec()))
     ↓
 Spark 执行层创建 HashPartitioning
     ↓
@@ -35,25 +44,28 @@ Spark 执行层创建 HashPartitioning
 
 ### 2.2 核心实现代码
 
-**1) 构建 Distribution 对象** (`spark/v3.3/spark/src/main/java/org/apache/iceberg/spark/SparkDistributionAndOrderingUtil.java:68-83`):
+**1) 构建 Distribution 对象** (`spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/SparkWriteUtil.java:76-90`):
 
 ```java
-public static Distribution buildRequiredDistribution(
-    Table table, DistributionMode distributionMode) {
-  switch (distributionMode) {
+private static Distribution writeDistribution(Table table, DistributionMode mode) {
+  switch (mode) {
     case NONE:
       return Distributions.unspecified();
 
     case HASH:
       // 将 Iceberg PartitionSpec 转换为 Spark Transform，然后创建 ClusteredDistribution
-      return Distributions.clustered(Spark3Util.toTransforms(table.spec()));
+      return Distributions.clustered(clustering(table));
 
     case RANGE:
-      return Distributions.ordered(buildTableOrdering(table));
+      return Distributions.ordered(ordering(table));
 
     default:
-      throw new IllegalArgumentException("Unsupported distribution mode: " + distributionMode);
+      throw new IllegalArgumentException("Unsupported distribution mode: " + mode);
   }
+}
+
+private static Expression[] clustering(Table table) {
+  return Spark3Util.toTransforms(table.spec());
 }
 ```
 
@@ -67,7 +79,7 @@ public static Distribution buildRequiredDistribution(
 
 ### 3.1 PartitionSpec 到 Spark Transform 的转换
 
-**转换入口** (`spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/Spark3Util.java:291-295`):
+**转换入口** (`spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/Spark3Util.java:299-303`):
 
 ```java
 public static Transform[] toTransforms(PartitionSpec spec) {
@@ -79,7 +91,7 @@ public static Transform[] toTransforms(PartitionSpec spec) {
 
 ### 3.2 支持的 Transform 类型
 
-**Transform 转换器实现** (`Spark3Util.java:297-354`):
+**Transform 转换器实现** (`Spark3Util.java:305-362`):
 
 ```java
 private static class SpecTransformToSparkTransform implements PartitionSpecVisitor<Transform> {
@@ -135,7 +147,7 @@ private static class SpecTransformToSparkTransform implements PartitionSpecVisit
 
 ### 4.1 PartitionData 的 hashCode 实现
 
-**核心 Hash 计算** (`core/src/main/java/org/apache/iceberg/PartitionData.java:189-194`):
+**核心 Hash 计算** (`core/src/main/java/org/apache/iceberg/PartitionData.java:190-195`):
 
 ```java
 @Override
@@ -160,7 +172,7 @@ public int hashCode() {
 
 ### 4.2 PartitionKey 的工作机制
 
-**PartitionKey 类** (`api/src/main/java/org/apache/iceberg/PartitionKey.java:30-65`):
+**PartitionKey 类** (`api/src/main/java/org/apache/iceberg/PartitionKey.java:30-74`):
 
 ```java
 public class PartitionKey extends StructTransform {
@@ -216,11 +228,13 @@ HashPartitioning(expressions = transforms, numPartitions = taskNum)
 
 ### 5.2 数据写入时的 Hash 分布
 
-**写入流程** (`spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java:751-806`):
+**写入流程** (`spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java:788-843`):
 
 ```java
 private static class PartitionedDataWriter implements DataWriter<InternalRow> {
   private final PartitioningWriter<InternalRow, DataWriteResult> delegate;
+  private final FileIO io;
+  private final PartitionSpec spec;
   private final PartitionKey partitionKey;
   private final InternalRowWrapper internalRowWrapper;
 
@@ -230,8 +244,9 @@ private static class PartitionedDataWriter implements DataWriter<InternalRow> {
     } else {
       this.delegate = new ClusteredDataWriter<>(...);  // 聚合相同分区的数据
     }
+    this.spec = spec;
     this.partitionKey = new PartitionKey(spec, dataSchema);
-    this.internalRowWrapper = new InternalRowWrapper(dataSparkType);
+    this.internalRowWrapper = new InternalRowWrapper(dataSparkType, dataSchema.asStruct());
   }
 
   @Override
@@ -270,9 +285,13 @@ private static class PartitionedDataWriter implements DataWriter<InternalRow> {
 ### 6.1 普通写入场景（Append/Overwrite）
 
 ```java
-// SparkDistributionAndOrderingUtil.java:68-83
+// SparkWriteUtil.java:76-90
 case HASH:
-  return Distributions.clustered(Spark3Util.toTransforms(table.spec()));
+  return Distributions.clustered(clustering(table));
+
+private static Expression[] clustering(Table table) {
+  return Spark3Util.toTransforms(table.spec());
+}
 ```
 
 **行为**：
@@ -290,14 +309,17 @@ INSERT INTO iceberg_table VALUES (...);
 ### 6.2 Copy-on-Write DELETE/UPDATE 场景
 
 ```java
-// SparkDistributionAndOrderingUtil.java:103-126
-private static Distribution buildCopyOnWriteDeleteUpdateDistribution(
-    Table table, DistributionMode distributionMode) {
-  switch (distributionMode) {
+// SparkWriteUtil.java:109-133
+private static Distribution copyOnWriteDeleteUpdateDistribution(
+    Table table, DistributionMode mode) {
+  switch (mode) {
     case HASH:
-      // 特殊处理：按文件路径进行 hash，而不是按分区键
-      Expression[] clustering = new Expression[] {FILE_PATH};
-      return Distributions.clustered(clustering);
+      if (table.spec().isPartitioned()) {
+        return Distributions.clustered(clustering(table));
+      } else {
+        // 特殊处理：按文件路径进行 hash，而不是按分区键
+        return Distributions.clustered(FILE_CLUSTERING);
+      }
 
     // ...
   }
@@ -312,23 +334,17 @@ private static Distribution buildCopyOnWriteDeleteUpdateDistribution(
 ### 6.3 Position Delete 场景
 
 ```java
-// SparkDistributionAndOrderingUtil.java:169-199
-private static Distribution buildPositionMergeDistribution(
-    Table table, DistributionMode distributionMode) {
-  switch (distributionMode) {
+// SparkWriteUtil.java:154-178
+private static Distribution positionDeltaUpdateMergeDistribution(
+    Table table, DistributionMode mode) {
+  switch (mode) {
     case HASH:
       if (table.spec().isUnpartitioned()) {
-        // 未分区表：按 (spec_id, partition, file_path) hash
-        Expression[] clustering = new Expression[] {SPEC_ID, PARTITION, FILE_PATH};
-        return Distributions.clustered(clustering);
+        // 未分区表：按 (spec_id, partition, file_path) + 表分区键 hash
+        return Distributions.clustered(concat(PARTITION_FILE_CLUSTERING, clustering(table)));
       } else {
         // 分区表：组合 delete 和 data 的 clustering
-        Distribution dataDistribution = buildRequiredDistribution(table, distributionMode);
-        Expression[] dataClustering = ((ClusteredDistribution) dataDistribution).clustering();
-        Expression[] deleteClustering = new Expression[] {SPEC_ID, PARTITION};
-        Expression[] clustering =
-            ObjectArrays.concat(deleteClustering, dataClustering, Expression.class);
-        return Distributions.clustered(clustering);
+        return Distributions.clustered(concat(PARTITION_CLUSTERING, clustering(table)));
       }
   }
 }
@@ -458,7 +474,11 @@ PARTITIONED BY (bucket(1000, user_id))
 ```
 DistributionMode.HASH
   ↓
-SparkDistributionAndOrderingUtil.buildRequiredDistribution()
+SparkWriteConf.writeRequirements()
+  ↓
+SparkWriteUtil.writeRequirements()
+  ↓
+SparkWriteUtil.writeDistribution(table, HASH)
   ↓
 Spark3Util.toTransforms(PartitionSpec)
   ↓
@@ -477,12 +497,71 @@ PartitionedDataWriter → ClusteredDataWriter/FanoutDataWriter
 
 - **源码位置**：
   - `api/src/main/java/org/apache/iceberg/DistributionMode.java`
-  - `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/SparkDistributionAndOrderingUtil.java`
+  - `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/SparkWriteUtil.java`
   - `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/Spark3Util.java`
   - `core/src/main/java/org/apache/iceberg/PartitionData.java`
   - `api/src/main/java/org/apache/iceberg/PartitionKey.java`
+  - `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java`
 
 - **相关配置**：
   - `write.distribution-mode`: 设置分布模式（none/hash/range）
   - `write.fanout-enabled`: 是否启用 fanout writer
   - `write.target-file-size-bytes`: 目标文件大小
+
+---
+
+## 11. 文档修正记录
+
+### 修正日期：2026-04-20
+
+#### 修正内容：
+
+1. **DistributionMode.java 行号修正**
+   - 原文档：第32-33行包含 HASH 定义
+   - 实际情况：第32-33行是注释，HASH 枚举定义在第41行
+   - 修正：分离注释说明和枚举定义的行号引用
+
+2. **核心类名修正**
+   - 原文档：引用 `SparkDistributionAndOrderingUtil` 类
+   - 实际情况：该类不存在，实际逻辑在 `SparkWriteUtil` 类中
+   - 修正：所有引用改为 `SparkWriteUtil`
+
+3. **Spark3Util.java 行号修正**
+   - 原文档：toTransforms 方法在第291-295行
+   - 实际情况：toTransforms 方法在第299-303行
+   - 修正：更新为正确的行号
+
+4. **PartitionKey.java 行号修正**
+   - 原文档：类定义在第30-65行
+   - 实际情况：类定义在第30-74行
+   - 修正：更新为正确的行号范围
+
+5. **SparkWrite.java 行号修正**
+   - 原文档：PartitionedDataWriter 在第751-806行
+   - 实际情况：PartitionedDataWriter 在第788-843行
+   - 修正：更新为正确的行号范围
+
+6. **代码细节修正**
+   - 原文档：InternalRowWrapper 构造函数只有一个参数
+   - 实际情况：InternalRowWrapper 构造函数有两个参数 (dataSparkType, dataSchema.asStruct())
+   - 修正：更新构造函数调用代码
+
+7. **方法调用链修正**
+   - 原文档：SparkWriteBuilder.buildWriteRequirements()
+   - 实际情况：SparkWriteBuilder.build() → writeRequirements() → SparkWriteConf.writeRequirements()
+   - 修正：更新完整的调用链路
+
+#### 验证方法：
+- 直接读取 Iceberg 源码文件进行逐行对照
+- 验证所有类名、方法名、字段名的准确性
+- 确认行号引用与实际源码一致
+
+#### 验证范围：
+- ✅ DistributionMode.java
+- ✅ Spark3Util.java
+- ✅ PartitionData.java
+- ✅ PartitionKey.java
+- ✅ SparkWrite.java
+- ✅ SparkWriteUtil.java
+- ✅ SparkWriteConf.java
+- ✅ SparkWriteRequirements.java

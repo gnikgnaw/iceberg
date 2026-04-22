@@ -8,7 +8,7 @@
 | :--- | :--- | :--- |
 | **设计目标** | 精确反映数据源的每一步变更 (Insert/Update/Delete) | 简化处理，假定流中包含最新的记录状态，自动处理去重 |
 | **输入要求** | 需要完整的变更流 (`+I`, `-U`, `+U`, `-D`) | 只需要 `INSERT` / `UPDATE_AFTER` 即可工作 (忽略 `UPDATE_BEFORE`) |
-| **Delete 实现** | `UPDATE_BEFORE` -> Pos Delete / Eq Delete<br>`DELETE` -> Eq Delete | `INSERT`/`UPDATE_AFTER` -> 自动触发 Eq Delete (按主键删除旧数据) + Data Insert |
+| **Delete 实现** | `UPDATE_BEFORE` -> Eq Delete<br>`DELETE` -> Eq Delete | `INSERT`/`UPDATE_AFTER` -> 自动触发 Eq Delete (按主键删除旧数据) + Data Insert |
 | **性能影响** | 写入逻辑简单，但读取时需要合并更多的 Delete File | 写入时增加了 Delete 操作 (写放大)，但保证了数据的唯一性语义 |
 
 ## 2. 源码逻辑分析
@@ -115,7 +115,7 @@ public void write(RowData row) throws IOException {
     *   **Action**: 仅生成 `Data Insert`。
     *   **风险**: 如果表里已有相同主键数据，会导致主键重复 (Duplicates)，除非下游读取时通过合并去重。
 2.  **收到 `-U` (UPDATE_BEFORE)**:
-    *   **Action**: 生成 `Position Delete` (如果可能) 或 `Equality Delete`，精确删除该版本的旧数据。
+    *   **Action**: 生成 `Equality Delete`，删除该版本的旧数据。
 3.  **收到 `-D` (DELETE)**:
     *   **Action**: 同上，生成 Delete 记录。
 
@@ -129,3 +129,11 @@ public void write(RowData row) throws IOException {
 *   **使用普通模式的场景**:
     *   上游是严格的 CDC 流 (如 MySQL binlog -> Flink)，完整保留了所有变更历史 (`-U`, `+U`)。
     *   你希望保留数据的每一次变更历史，或者希望减少写入时的 Delete File 开销 (如果确定没有重复数据)。
+
+---
+## 文档修正记录
+- 修正时间：2026-04-20
+- 修正内容：
+  1. **表格中 Delete 实现描述修正**：普通模式下 `UPDATE_BEFORE` 生成的是 `Equality Delete`，而非 `Position Delete / Eq Delete`。根据源码 `BaseDeltaTaskWriter.java` 第 98 行，`UPDATE_BEFORE` 调用的是 `writer.delete(row)`，该方法在 `BaseEqualityDeltaWriter` 中（`BaseTaskWriter.java` 第 291-294 行）实现为：先尝试 Position Delete（如果该行在当前写入批次的 insertedRowMap 中），否则写入 Equality Delete。但由于 CDC 场景下 `UPDATE_BEFORE` 通常不在当前批次的 insertedRowMap 中，因此实际上会生成 Equality Delete。
+  2. **第 2.3 节普通模式流程描述修正**：将 "生成 `Position Delete` (如果可能) 或 `Equality Delete`" 简化为 "生成 `Equality Delete`"，以反映实际的 CDC 场景行为。虽然代码逻辑上支持 Position Delete（针对同批次内的数据），但在典型的 CDC 流中，`UPDATE_BEFORE` 删除的是历史数据，不会命中 insertedRowMap，因此实际生成的是 Equality Delete。
+---

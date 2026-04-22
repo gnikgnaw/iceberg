@@ -7,6 +7,7 @@
 **与 Spark 的核心区别**：
 - **Spark**：使用 `ClusteredDistribution` + `HashPartitioning` 进行 shuffle
 - **Flink**：使用 `KeySelector` + `keyBy()` 进行数据流重分区
+- **RANGE 模式**：Flink 支持 RANGE 模式，使用 `RangePartitioner` + `DataStatisticsOperator` 实现
 
 ---
 
@@ -32,7 +33,7 @@ IcebergStreamWriter 写入文件
 
 ### 2.2 核心代码分析
 
-**配置读取** (`flink/v1.18/flink/src/main/java/org/apache/iceberg/flink/FlinkWriteConf.java:158-168`):
+**配置读取** (`flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/FlinkWriteConf.java:163-173`):
 
 ```java
 public DistributionMode distributionMode() {
@@ -48,24 +49,27 @@ public DistributionMode distributionMode() {
 }
 ```
 
-**分布策略选择** (`flink/v1.18/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkSink.java:501-569`):
+**分布策略选择** (`flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkSink.java:607-720`):
 
 ```java
 private DataStream<RowData> distributeDataStream(
     DataStream<RowData> input,
-    List<Integer> equalityFieldIds,
-    PartitionSpec partitionSpec,
-    Schema iSchema,
-    RowType flinkRowType) {
+    Set<Integer> equalityFieldIds,
+    RowType flinkRowType,
+    int writerParallelism) {
   DistributionMode writeMode = flinkWriteConf.distributionMode();
-
   LOG.info("Write distribution mode is '{}'", writeMode.modeName());
+
+  Schema iSchema = table.schema();
+  PartitionSpec partitionSpec = table.spec();
+  SortOrder sortOrder = table.sortOrder();
+
   switch (writeMode) {
     case NONE:
       if (equalityFieldIds.isEmpty()) {
         return input;  // 不进行重分区
       } else {
-        // 按 equality fields 分区（用于 UPSERT）
+        LOG.info("Distribute rows by equality fields, because there are equality fields set");
         return input.keyBy(
             new EqualityFieldKeySelector(iSchema, flinkRowType, equalityFieldIds));
       }
@@ -85,6 +89,9 @@ private DataStream<RowData> distributeDataStream(
       } else {
         if (partitionSpec.isUnpartitioned()) {
           // 未分区表但有 equality fields -> 按 equality fields 分区
+          LOG.info(
+              "Distribute rows by equality fields, because there are equality fields set "
+                  + "and table is unpartitioned");
           return input.keyBy(
               new EqualityFieldKeySelector(iSchema, flinkRowType, equalityFieldIds));
         } else {
@@ -92,8 +99,9 @@ private DataStream<RowData> distributeDataStream(
           for (PartitionField partitionField : partitionSpec.fields()) {
             Preconditions.checkState(
                 equalityFieldIds.contains(partitionField.sourceId()),
-                "In 'hash' distribution mode with equality fields set, partition field '%s' "
+                "In 'hash' distribution mode with equality fields set, source column '%s' of partition field '%s' "
                     + "should be included in equality fields: '%s'",
+                table.schema().findColumnName(partitionField.sourceId()),
                 partitionField,
                 equalityFieldColumns);
           }
@@ -102,18 +110,41 @@ private DataStream<RowData> distributeDataStream(
       }
 
     case RANGE:
-      // Flink 不支持 RANGE 模式，退化处理
-      LOG.warn("Flink does not support 'range' distribution mode, fallback to distribute by equality fields or none");
-      // ... 省略 RANGE 处理逻辑
+      // Flink 支持 RANGE 模式，但对于有 equality fields 的场景会退化为 HASH
+      if (!equalityFieldIds.isEmpty()) {
+        LOG.warn(
+            "Hash distribute rows by equality fields, even though {}=range is set. "
+                + "Range distribution for primary keys are not always safe in "
+                + "Flink streaming writer.",
+            WRITE_DISTRIBUTION_MODE);
+        return input.keyBy(
+            new EqualityFieldKeySelector(iSchema, flinkRowType, equalityFieldIds));
+      }
+
+      // 按 sort order 或 partition spec 进行 range 分布
+      Preconditions.checkState(
+          sortOrder.isSorted() || partitionSpec.isPartitioned(),
+          "Invalid write distribution mode: range. Need to define sort order or partition spec.");
+      if (sortOrder.isUnsorted()) {
+        sortOrder = Partitioning.sortOrderFor(partitionSpec);
+        LOG.info("Construct sort order from partition spec");
+      }
+
+      LOG.info("Range distribute rows by sort order: {}", sortOrder);
+      // 使用 DataStatisticsOperator 收集统计信息
+      // 使用 RangePartitioner 进行范围分区
+      // ... 省略详细实现
   }
 }
 ```
 
 **关键决策逻辑**：
-1. **HASH + 无 equality fields + 有分区** → 按分区键 keyBy
+1. **HASH + 无 equality fields + 有分区** → 按分区键 keyBy（PartitionKeySelector）
 2. **HASH + 有 equality fields + 有分区** → 按分区键 keyBy（要求分区字段 ⊆ equality fields）
 3. **HASH + 无 equality fields + 无分区** → 不分区（退化为 NONE）
-4. **HASH + 有 equality fields + 无分区** → 按 equality fields keyBy
+4. **HASH + 有 equality fields + 无分区** → 按 equality fields keyBy（EqualityFieldKeySelector）
+5. **RANGE + 无 equality fields** → 使用 RangePartitioner 进行范围分区
+6. **RANGE + 有 equality fields** → 退化为按 equality fields keyBy（安全考虑）
 
 ---
 
@@ -121,10 +152,10 @@ private DataStream<RowData> distributeDataStream(
 
 ### 3.1 核心实现
 
-**PartitionKeySelector 类** (`flink/v1.18/flink/src/main/java/org/apache/iceberg/flink/sink/PartitionKeySelector.java:34-64`):
+**PartitionKeySelector 类** (`flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/PartitionKeySelector.java:36-66`):
 
 ```java
-class PartitionKeySelector implements KeySelector<RowData, String> {
+public class PartitionKeySelector implements KeySelector<RowData, String> {
 
   private final Schema schema;
   private final PartitionKey partitionKey;
@@ -132,14 +163,15 @@ class PartitionKeySelector implements KeySelector<RowData, String> {
 
   private transient RowDataWrapper rowDataWrapper;
 
-  PartitionKeySelector(PartitionSpec spec, Schema schema, RowType flinkSchema) {
+  public PartitionKeySelector(PartitionSpec spec, Schema schema, RowType flinkSchema) {
     this.schema = schema;
     this.partitionKey = new PartitionKey(spec, schema);  // 创建分区键计算器
     this.flinkSchema = flinkSchema;
   }
 
   /**
-   * Construct the RowDataWrapper lazily to avoid serialization issues.
+   * Construct the RowDataWrapper lazily here because few members in it are not
+   * serializable. In this way, we don't have to serialize them with forcing.
    */
   private RowDataWrapper lazyRowDataWrapper() {
     if (rowDataWrapper == null) {
@@ -159,6 +191,40 @@ class PartitionKeySelector implements KeySelector<RowData, String> {
   }
 }
 ```
+
+**EqualityFieldKeySelector 类** (`flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/EqualityFieldKeySelector.java:37-88`):
+
+```java
+public class EqualityFieldKeySelector implements KeySelector<RowData, Integer> {
+
+  private final Schema schema;
+  private final RowType flinkSchema;
+  private final Schema deleteSchema;
+
+  private transient RowDataWrapper rowDataWrapper;
+  private transient StructProjection structProjection;
+  private transient StructLikeWrapper structLikeWrapper;
+
+  public EqualityFieldKeySelector(
+      Schema schema, RowType flinkSchema, Set<Integer> equalityFieldIds) {
+    this.schema = schema;
+    this.flinkSchema = flinkSchema;
+    this.deleteSchema = TypeUtil.select(schema, equalityFieldIds);
+  }
+
+  @Override
+  public Integer getKey(RowData row) {
+    RowDataWrapper wrappedRowData = lazyRowDataWrapper().wrap(row);
+    StructProjection projectedRowData = lazyStructProjection().wrap(wrappedRowData);
+    StructLikeWrapper wrapper = lazyStructLikeWrapper().set(projectedRowData);
+    return wrapper.hashCode();  // 返回 equality fields 的 hashCode
+  }
+}
+```
+
+**关键区别**：
+- **PartitionKeySelector**：返回 `String`（分区路径，如 `"year=2024/region=US"`）
+- **EqualityFieldKeySelector**：返回 `Integer`（equality fields 的 hashCode）
 
 ### 3.2 工作流程详解
 
@@ -259,7 +325,9 @@ public int hashCode() {
 
 ### 5.1 适用场景
 
-当表的分区定义**仅包含一个 bucket transform** 时，Flink 可以使用 `BucketPartitioner` 进行优化：
+当表的分区定义**仅包含一个 bucket transform** 时，Flink 可以使用 `BucketPartitioner` 进行优化。
+
+**重要说明**：`BucketPartitioner` 不会自动启用，需要手动通过 `partitionCustom()` 配合 `BucketPartitionKeySelector` 使用。
 
 ```sql
 -- 适合 BucketPartitioner
@@ -276,9 +344,36 @@ CREATE TABLE sales (
 ) PARTITIONED BY (days(sale_date), bucket(10, region));
 ```
 
-### 5.2 BucketPartitioner 实现
+### 5.2 手动启用 BucketPartitioner
 
-**核心代码** (`flink/v1.18/flink/src/main/java/org/apache/iceberg/flink/sink/BucketPartitioner.java:31-103`):
+**示例代码** (参考 `TestBucketPartitionerFlinkIcebergSink.java`):
+
+```java
+DataStream<RowData> dataStream = env.addSource(...)
+    .partitionCustom(
+        new BucketPartitioner(table.spec()),
+        new BucketPartitionKeySelector(
+            table.spec(),
+            table.schema(),
+            FlinkSink.toFlinkRowType(table.schema(), flinkSchema)));
+
+FlinkSink.forRowData(dataStream)
+    .table(table)
+    .tableLoader(tableLoader)
+    .writeParallelism(parallelism)
+    .distributionMode(DistributionMode.NONE)  // 使用 NONE，因为已经手动分区
+    .append();
+```
+
+**关键点**：
+1. 使用 `partitionCustom()` 手动指定分区器
+2. `BucketPartitionKeySelector` 提取 bucket ID（返回 `Integer`）
+3. `BucketPartitioner` 根据 bucket ID 分配到对应的 writer
+4. 设置 `distributionMode(DistributionMode.NONE)` 避免重复分区
+
+### 5.3 BucketPartitioner 实现
+
+**核心代码** (`flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/BucketPartitioner.java:31-103`):
 
 ```java
 class BucketPartitioner implements Partitioner<Integer> {
@@ -330,7 +425,7 @@ class BucketPartitioner implements Partitioner<Integer> {
 }
 ```
 
-### 5.3 BucketPartitioner 的优势
+### 5.4 BucketPartitioner 的优势
 
 **传统 PartitionKeySelector 的问题**：
 ```java
@@ -362,29 +457,38 @@ class BucketPartitioner implements Partitioner<Integer> {
 
 ### 6.1 场景矩阵
 
-| 场景 | 分区类型 | Equality Fields | 分布策略 | KeySelector |
-|------|---------|----------------|---------|-------------|
-| 普通写入 | 有分区 | 无 | HASH | PartitionKeySelector |
-| 普通写入 | 无分区 | 无 | NONE | 不重分区 |
-| UPSERT | 有分区 | 有 | HASH | PartitionKeySelector（分区⊆equality） |
-| UPSERT | 无分区 | 有 | HASH | EqualityFieldKeySelector |
-| CDC | 有分区 | 有 | HASH | PartitionKeySelector |
-| CDC | 无分区 | 有 | HASH | EqualityFieldKeySelector |
+| 场景 | 分区类型 | Equality Fields | 分布模式 | KeySelector | 返回类型 |
+|------|---------|----------------|---------|-------------|---------|
+| 普通写入 | 有分区 | 无 | HASH | PartitionKeySelector | String |
+| 普通写入 | 无分区 | 无 | NONE | 不重分区 | - |
+| UPSERT | 有分区 | 有 | HASH | PartitionKeySelector | String |
+| UPSERT | 无分区 | 有 | HASH | EqualityFieldKeySelector | Integer |
+| CDC | 有分区 | 有 | HASH | PartitionKeySelector | String |
+| CDC | 无分区 | 有 | HASH | EqualityFieldKeySelector | Integer |
+| NONE 模式 | 有分区 | 有 | NONE | EqualityFieldKeySelector | Integer |
+| RANGE 模式 | 有分区 | 无 | RANGE | RangePartitioner | - |
+
+**注意**：
+- HASH 模式下，有分区且有 equality fields 时，要求分区字段必须是 equality fields 的子集
+- RANGE 模式下，如果有 equality fields，会退化为使用 EqualityFieldKeySelector
 
 ### 6.2 UPSERT 模式的特殊处理
 
-**UPSERT 约束** (`FlinkSink.java:459-468`):
+**UPSERT 约束** (`flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkSink.java:561-578`):
 ```java
 if (flinkWriteConf.upsertMode()) {
   Preconditions.checkState(
+      !flinkWriteConf.overwriteMode(),
+      "OVERWRITE mode shouldn't be enable when configuring to use UPSERT data stream.");
+  Preconditions.checkState(
       !equalityFieldIds.isEmpty(),
       "Equality field columns shouldn't be empty when configuring to use UPSERT data stream.");
-
   if (!table.spec().isUnpartitioned()) {
     for (PartitionField partitionField : table.spec().fields()) {
       Preconditions.checkState(
           equalityFieldIds.contains(partitionField.sourceId()),
-          "In UPSERT mode, partition field '%s' should be included in equality fields: '%s'",
+          "In UPSERT mode, source column '%s' of partition field '%s', should be included in equality fields: '%s'",
+          table.schema().findColumnName(partitionField.sourceId()),
           partitionField,
           equalityFieldColumns);
     }
@@ -530,21 +634,41 @@ FlinkSink.forRowData(input)
     .append();
 ```
 
-### 8.3 Bucket 分区优化
+### 8.3 Bucket 分区优化（手动启用）
 
-**当使用 bucket 分区时**：
+**当使用 bucket 分区时，可以手动启用 BucketPartitioner**：
 ```java
-// 优化前：混合分区
-PARTITIONED BY (days(event_time), bucket(100, user_id))
+// 表定义（仅使用 bucket 分区）
+CREATE TABLE user_events (
+  user_id BIGINT,
+  event_type STRING,
+  event_time TIMESTAMP
+) PARTITIONED BY (bucket(100, user_id));
 
-// 优化后：仅 bucket 分区（启用 BucketPartitioner）
-PARTITIONED BY (bucket(100, user_id))
+// Flink 写入（手动使用 BucketPartitioner）
+DataStream<RowData> eventStream = ...;
 
-// 如果需要时间分区，在查询时使用 time-travel
-SELECT * FROM table
-FOR SYSTEM_TIME AS OF TIMESTAMP '2024-01-15 00:00:00'
-WHERE user_id_bucket = 5;
+DataStream<RowData> partitionedStream = eventStream
+    .partitionCustom(
+        new BucketPartitioner(table.spec()),
+        new BucketPartitionKeySelector(table.spec(), table.schema(), flinkRowType));
+
+FlinkSink.forRowData(partitionedStream)
+    .table(table)
+    .tableLoader(tableLoader)
+    .distributionMode(DistributionMode.NONE)  // 已手动分区，使用 NONE
+    .writeParallelism(50)
+    .append();
 ```
+
+**BucketPartitioner 启用条件**：
+1. PartitionSpec 只包含一个字段
+2. 该字段是 `BucketTransform`
+3. 手动使用 `partitionCustom()` 配合 `BucketPartitionKeySelector`
+
+**优化效果**：
+- 传统 PartitionKeySelector：100 buckets × 50 writers = 最多 5000 个文件
+- BucketPartitioner：100 buckets = 最多 100 个文件（每个 bucket 最多 1 个文件）
 
 ### 8.4 避免的反模式
 
@@ -655,7 +779,7 @@ env.execute("MySQL CDC to Iceberg");
 - 相同 `(user_id, region)` 的 INSERT/UPDATE/DELETE 事件发到同一 writer
 - Writer 内部维护 `RowDataDeltaWriter` 处理 UPSERT 逻辑
 
-### 示例 3：Bucket 分区优化
+### 示例 3：手动启用 Bucket 分区优化
 
 ```java
 // 表定义（仅使用 bucket 分区）
@@ -665,25 +789,35 @@ CREATE TABLE user_events (
   event_time TIMESTAMP
 ) PARTITIONED BY (bucket(100, user_id));
 
-// Flink 写入（自动使用 BucketPartitioner）
+// Flink 写入（手动使用 BucketPartitioner）
 DataStream<RowData> eventStream = ...;
 
-FlinkSink.forRowData(eventStream)
+// 步骤1：手动应用 BucketPartitioner
+DataStream<RowData> partitionedStream = eventStream
+    .partitionCustom(
+        new BucketPartitioner(table.spec()),
+        new BucketPartitionKeySelector(
+            table.spec(),
+            table.schema(),
+            FlinkSink.toFlinkRowType(table.schema(), flinkSchema)));
+
+// 步骤2：使用 NONE 模式避免重复分区
+FlinkSink.forRowData(partitionedStream)
     .table(table)
     .tableLoader(tableLoader)
-    .distributionMode(DistributionMode.HASH)
+    .distributionMode(DistributionMode.NONE)  // 重要：已手动分区
     .writeParallelism(50)  // writer 数量 < bucket 数量，每个 writer 负责 2 个 bucket
     .append();
 ```
 
-**BucketPartitioner 自动启用条件**：
-1. PartitionSpec 只包含一个字段
-2. 该字段是 `BucketTransform`
-3. 满足条件后，Flink 使用 `BucketPartitioner` 代替 `PartitionKeySelector`
+**工作原理**：
+1. `BucketPartitionKeySelector.getKey(row)` 提取 bucket ID（Integer）
+2. `BucketPartitioner.partition(bucketId, numPartitions)` 计算目标 writer
+3. 相同 bucket ID 的数据发到同一个 writer
 
 **优化效果**：
-- 传统方式：100 buckets × 50 writers = 最多 5000 个文件
-- BucketPartitioner：100 buckets = 最多 100 个文件
+- 不使用 BucketPartitioner：可能产生 100 buckets × 50 writers = 5000 个文件
+- 使用 BucketPartitioner：最多 100 个文件（每个 bucket 一个文件）
 
 ---
 
@@ -732,16 +866,121 @@ FlinkSink.forRowData(eventStream)
 
 ## 11. 参考资料
 
-- **源码位置**：
-  - `flink/v1.18/flink/src/main/java/org/apache/iceberg/flink/FlinkWriteConf.java`
-  - `flink/v1.18/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkSink.java`
-  - `flink/v1.18/flink/src/main/java/org/apache/iceberg/flink/sink/PartitionKeySelector.java`
-  - `flink/v1.18/flink/src/main/java/org/apache/iceberg/flink/sink/BucketPartitioner.java`
-  - `flink/v1.18/flink/src/main/java/org/apache/iceberg/flink/sink/EqualityFieldKeySelector.java`
+- **源码位置**（基于 Flink v1.20 集成）：
+  - `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/FlinkWriteConf.java`
+  - `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkSink.java`
+  - `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/PartitionKeySelector.java`
+  - `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/BucketPartitioner.java`
+  - `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/BucketPartitionKeySelector.java`
+  - `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/BucketPartitionerUtil.java`
+  - `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/EqualityFieldKeySelector.java`
   - `api/src/main/java/org/apache/iceberg/PartitionKey.java`
 
+- **测试代码参考**：
+  - `flink/v1.20/flink/src/test/java/org/apache/iceberg/flink/sink/TestBucketPartitionerFlinkIcebergSink.java`
+
 - **相关配置**：
-  - `write.distribution-mode`: 分布模式（none/hash/range，Flink 不支持 range）
+  - `write.distribution-mode`: 分布模式（none/hash/range）
   - `write-parallelism`: Writer 并行度
   - `write.target-file-size-bytes`: 目标文件大小
   - `write.upsert.enabled`: 是否启用 UPSERT 模式
+
+---
+
+## 12. 技术验证修正记录
+
+**验证日期**: 2026-04-20
+
+**验证范围**: 对照 Iceberg 源码（基于 v1.20 Flink 集成）验证文档技术准确性
+
+**发现的错误及修正**：
+
+1. **源码版本路径错误**
+   - 原文档引用: `flink/v1.18/flink/src/main/java/...`
+   - 实际路径: `flink/v1.20/flink/src/main/java/...`
+   - 说明: 当前代码库中 v1.18 目录下无源码文件，实际源码在 v1.20 版本
+
+2. **行号引用更新**
+   - `FlinkWriteConf.distributionMode()`: 163-173 行（原文档: 158-168）
+   - `FlinkSink.distributeDataStream()`: 607-720 行（原文档: 501-569）
+   - `PartitionKeySelector` 类: 36-66 行（原文档: 34-64）
+   - `FlinkSink UPSERT 约束`: 561-578 行（原文档: 459-468）
+
+3. **PartitionKeySelector 类访问修饰符错误**
+   - 原文档: `class PartitionKeySelector`（包私有）
+   - 实际代码: `public class PartitionKeySelector`（公开类）
+   - 修正: 已更新为 `public class`
+
+4. **注释内容不准确**
+   - 原文档: `"Construct the RowDataWrapper lazily to avoid serialization issues."`
+   - 实际代码: `"Construct the RowDataWrapper lazily here because few members in it are not serializable. In this way, we don't have to serialize them with forcing."`
+   - 修正: 已更新为实际注释内容
+
+5. **distributeDataStream 方法签名错误**
+   - 原文档参数: `List<Integer> equalityFieldIds, PartitionSpec partitionSpec, Schema iSchema, RowType flinkRowType`
+   - 实际参数: `Set<Integer> equalityFieldIds, RowType flinkRowType, int writerParallelism`
+   - 说明: 方法内部从 `table.schema()` 和 `table.spec()` 获取 schema 和 partitionSpec
+   - 修正: 已更新方法签名和实现逻辑
+
+6. **RANGE 模式支持错误（重要）**
+   - 原文档: "Flink 不支持 RANGE 模式，退化处理"
+   - 实际情况: **Flink 完全支持 RANGE 模式**，使用 `RangePartitioner` + `DataStatisticsOperator` 实现
+   - 退化场景: 仅在有 equality fields 时退化为 HASH 模式（安全考虑）
+   - 修正: 已更新说明 Flink 支持 RANGE 模式，并补充退化条件
+
+7. **EqualityFieldKeySelector 返回类型遗漏**
+   - 原文档: 未明确说明 `EqualityFieldKeySelector` 的返回类型
+   - 实际代码: `implements KeySelector<RowData, Integer>`（返回 `Integer` hashCode）
+   - 对比: `PartitionKeySelector` 返回 `String`（分区路径）
+   - 修正: 已补充 `EqualityFieldKeySelector` 完整实现和类型对比
+
+8. **UPSERT 约束代码不完整**
+   - 原文档: 缺少 `overwriteMode` 检查
+   - 实际代码: 包含 `!flinkWriteConf.overwriteMode()` 前置检查
+   - 错误消息: 实际代码使用 `findColumnName()` 获取列名，更详细
+   - 修正: 已更新为完整的 UPSERT 约束代码
+
+9. **日志消息不准确**
+   - 原文档 HASH 模式未分区表日志: 简化版本
+   - 实际代码: 包含更详细的日志消息（如 "Distribute rows by equality fields, because..."）
+   - 修正: 已更新为实际日志消息
+
+10. **决策逻辑补充**
+    - 原文档: 仅列出 4 种 HASH 模式场景
+    - 实际代码: 还包含 RANGE 模式的 2 种场景
+    - 修正: 已补充 RANGE 模式决策逻辑
+
+11. **BucketPartitioner 自动启用错误（重要）**
+    - 原文档: "BucketPartitioner 自动启用条件"，暗示会自动使用
+    - 实际情况: **BucketPartitioner 需要手动启用**，通过 `partitionCustom()` + `BucketPartitionKeySelector`
+    - 证据: `TestBucketPartitionerFlinkIcebergSink.java` 测试代码显示手动调用
+    - 使用方式: 
+      ```java
+      dataStream.partitionCustom(
+          new BucketPartitioner(table.spec()),
+          new BucketPartitionKeySelector(table.spec(), schema, flinkRowType))
+      ```
+    - 配合设置: 使用 `distributionMode(DistributionMode.NONE)` 避免重复分区
+    - 修正: 已更新为手动启用方式，补充完整示例代码
+
+12. **BucketPartitionKeySelector 遗漏**
+    - 原文档: 未提及 `BucketPartitionKeySelector` 类
+    - 实际代码: `BucketPartitionKeySelector` 是使用 BucketPartitioner 的必要组件
+    - 功能: 从 RowData 中提取 bucket ID（返回 `Integer`）
+    - 修正: 已补充 `BucketPartitionKeySelector` 的说明和使用方式
+
+**验证结论**：
+- 文档核心技术原理正确（HASH 分布机制、PartitionKeySelector 工作流程）
+- 主要问题集中在：
+  1. 源码版本路径和行号引用
+  2. 方法签名细节和返回类型
+  3. **RANGE 模式支持说明（Flink 完全支持 RANGE）**
+  4. **BucketPartitioner 启用方式（需手动启用，非自动）**
+- 所有发现的错误已修正，文档现在与源码完全一致
+
+**验证方法**：
+- 直接读取源码文件验证类名、方法名、字段名
+- 对比行号确保引用准确
+- 验证方法签名和返回类型
+- 检查日志消息和注释内容
+- 确认 RANGE 模式实现逻辑

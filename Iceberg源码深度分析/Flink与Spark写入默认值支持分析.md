@@ -61,12 +61,19 @@ public Builder withWriteDefault(Literal<?> fieldWriteDefault) {
 
 **关键发现**：通过分析Flink写入源码，**Flink写入时不会处理write-default值**。
 
-**证据1：Writer构建时不接收Iceberg Schema**
+**证据1：Writer构建时接收Iceberg Schema但不使用writeDefault**
 
 ```java
-// flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java:70
+// flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java:71-78
+public static <T> ParquetValueWriter<T> buildWriter(
+    Schema icebergSchema, MessageType type, RowType engineSchema) {
+  return buildWriter(
+      engineSchema != null ? engineSchema : FlinkSchemaUtil.convert(icebergSchema), type);
+}
+
+@SuppressWarnings("unchecked")
 public static <T> ParquetValueWriter<T> buildWriter(LogicalType schema, MessageType type) {
-  // ❌ 只接收Flink的LogicalType，不接收Iceberg Schema
+  // ❌ 虽然上层方法接收icebergSchema，但最终只使用LogicalType
   // 因此无法访问NestedField中的writeDefault信息
   return (ParquetValueWriter<T>)
       ParquetWithFlinkSchemaVisitor.visit(schema, type, new WriteBuilder(type));
@@ -102,19 +109,20 @@ Flink RowData写入流程（无默认值处理）：
    └─ 创建任务级别的Writer
       关键代码：flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/RowDataTaskWriterFactory.java:46-150
 
-3. FlinkFileWriterFactory
+3. FlinkAppenderFactory
    └─ 构建文件格式Writer（Parquet/Avro/ORC）
-      关键代码：flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkFileWriterFactory.java:96
+      关键代码：flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkAppenderFactory.java:148
 
       // ❌ 这里只传递LogicalType，不传递Iceberg Schema
-      builder.createWriterFunc(msgType -> FlinkParquetWriters.buildWriter(dataFlinkType(), msgType));
+      builder.createWriterFunc(msgType -> FlinkParquetWriters.buildWriter(flinkSchema, msgType));
 
 4. FlinkParquetWriters
    └─ 构建Parquet Writer
-      关键代码：flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java:70
+      关键代码：flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java:71-78
 
-      // ❌ 只接收LogicalType参数，无法访问writeDefault
-      public static <T> ParquetValueWriter<T> buildWriter(LogicalType schema, MessageType type)
+      // ❌ 虽然接收icebergSchema参数，但最终只使用LogicalType，无法访问writeDefault
+      public static <T> ParquetValueWriter<T> buildWriter(
+          Schema icebergSchema, MessageType type, RowType engineSchema)
 ```
 
 **根本原因**：Flink的Writer接口设计只使用Flink自己的类型系统（LogicalType），不感知Iceberg Schema的扩展属性（如writeDefault）。
@@ -123,23 +131,33 @@ Flink RowData写入流程（无默认值处理）：
 
 **实际代码分析**：
 
-**FlinkFileWriterFactory配置Writer**
+**FlinkAppenderFactory配置Writer**
 
 ```java
-// flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkFileWriterFactory.java:95-97
-@Override
-protected void configureDataWrite(Parquet.DataWriteBuilder builder) {
-  // ❌ 只传递LogicalType，没有Iceberg Schema
-  builder.createWriterFunc(msgType -> FlinkParquetWriters.buildWriter(dataFlinkType(), msgType));
-}
+// flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkAppenderFactory.java:148
+builder
+    .createWriterFunc(msgType -> FlinkParquetWriters.buildWriter(flinkSchema, msgType))
+    .setAll(props)
+    .metricsConfig(metricsConfig)
+    .schema(schema)
+    .overwrite()
+    .build();
+// ❌ 虽然传递了flinkSchema（LogicalType），但没有传递完整的Iceberg Schema
 ```
 
 **FlinkParquetWriters构建Writer**
 
 ```java
-// flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java:70-73
+// flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java:71-78
+public static <T> ParquetValueWriter<T> buildWriter(
+    Schema icebergSchema, MessageType type, RowType engineSchema) {
+  return buildWriter(
+      engineSchema != null ? engineSchema : FlinkSchemaUtil.convert(icebergSchema), type);
+}
+
+@SuppressWarnings("unchecked")
 public static <T> ParquetValueWriter<T> buildWriter(LogicalType schema, MessageType type) {
-  // ❌ 参数中没有Iceberg Schema，无法访问writeDefault
+  // ❌ 最终只使用LogicalType，无法访问writeDefault
   return (ParquetValueWriter<T>)
       ParquetWithFlinkSchemaVisitor.visit(schema, type, new WriteBuilder(type));
 }
@@ -148,14 +166,25 @@ public static <T> ParquetValueWriter<T> buildWriter(LogicalType schema, MessageT
 **Struct Writer处理**
 
 ```java
-// flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java:89-107
+// flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java:97-114
 @Override
 public ParquetValueWriter<?> struct(
     RowType sStruct, GroupType struct, List<ParquetValueWriter<?>> fieldWriters) {
-  // ❌ 只处理RowType中存在的字段
-  // 如果RowData中字段缺失，直接写入NULL，不会检查或填充writeDefault
   List<RowField> flinkFields = sStruct.getFields();
-  // ...
+  List<ParquetValueWriter<?>> writers = Lists.newArrayListWithExpectedSize(fieldWriters.size());
+  List<LogicalType> flinkTypes = Lists.newArrayList();
+  int[] fieldIndexes = new int[fieldWriters.size()];
+  int fieldIndex = 0;
+  for (int i = 0; i < flinkFields.size(); i += 1) {
+    LogicalType flinkType = flinkFields.get(i).getType();
+    if (!flinkType.is(LogicalTypeRoot.NULL)) {
+      writers.add(newOption(struct.getType(fieldIndex), fieldWriters.get(fieldIndex)));
+      flinkTypes.add(flinkType);
+      fieldIndexes[fieldIndex] = i;
+      fieldIndex += 1;
+    }
+  }
+  // ❌ 只处理RowType中存在的字段，不会检查或填充writeDefault
   return new RowDataWriter(fieldIndexes, writers, flinkTypes);
 }
 ```
@@ -212,7 +241,7 @@ SELECT * FROM iceberg_catalog.db.users;
 
 **源码位置**：
 ```
-spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/Spark3Util.java:548-558
+spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/Spark3Util.java:232-246
 ```
 
 **关键代码**：
@@ -247,10 +276,7 @@ private static void apply(UpdateSchema pendingUpdate, TableChange.AddColumn add)
 
 **但Spark支持在INSERT中使用`DEFAULT`关键字**：
 
-**测试代码**：
-```
-spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/sql/TestSparkDefaultValues.java:50-83
-```
+**注意**：文档编写时引用的测试文件路径可能不存在于当前代码库中，但功能确实存在于Spark 4.0+版本。
 
 ```sql
 -- 1. 创建表（通过Iceberg API，因为Spark DDL不支持DEFAULT）
@@ -285,7 +311,7 @@ if (field.writeDefault() != null) {
 **步骤2：SQL解析阶段，Spark识别DEFAULT关键字**
 
 ```sql
--- 测试用例：spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/sql/TestSparkDefaultValues.java:77
+-- Spark SQL支持DEFAULT关键字
 INSERT INTO users VALUES (1, DEFAULT, DEFAULT, DEFAULT);
 ```
 
@@ -296,29 +322,19 @@ INSERT INTO users VALUES (1, DEFAULT, DEFAULT, DEFAULT);
 **步骤4：SparkParquetWriter写入实际值**
 
 ```java
-// spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/data/SparkParquetWriters.java:79-112
-@SuppressWarnings("unchecked")
+// spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/data/SparkParquetWriters.java:80-90
 public static <T> ParquetValueWriter<T> buildWriter(StructType dfSchema, MessageType type) {
-  return (ParquetValueWriter<T>)
-      ParquetWithSparkSchemaVisitor.visit(dfSchema, type, new WriteBuilder(type));
+  return buildWriter(null, type, dfSchema);
 }
 
-@Override
-public ParquetValueWriter<?> struct(
-    StructType sStruct, GroupType struct, List<ParquetValueWriter<?>> fieldWriters) {
-  List<Type> fields = struct.getFields();
-  List<ParquetValueWriter<?>> writers = Lists.newArrayListWithExpectedSize(fieldWriters.size());
-  for (int i = 0; i < fields.size(); i += 1) {
-    writers.add(newOption(struct.getType(i), fieldWriters.get(i)));
-  }
-
-  StructField[] sFields = sStruct.fields();
-  DataType[] types = new DataType[sFields.length];
-  for (int i = 0; i < sFields.length; i += 1) {
-    types[i] = sFields[i].dataType();
-  }
-
-  return new InternalRowWriter(writers, types);
+@SuppressWarnings("unchecked")
+public static <T> ParquetValueWriter<T> buildWriter(
+    Schema icebergSchema, MessageType type, StructType dfSchema) {
+  return (ParquetValueWriter<T>)
+      ParquetWithSparkSchemaVisitor.visit(
+          dfSchema != null ? dfSchema : SparkSchemaUtil.convert(icebergSchema),
+          type,
+          new WriteBuilder(type));
 }
 
 // 注意：buildWriter直接基于Spark的StructType构建
@@ -369,20 +385,22 @@ INSERT INTO users VALUES (1, DEFAULT);
 **1. 架构设计限制：Writer不检查Iceberg Schema**
 
 ```java
-// spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/data/SparkParquetWriters.java:79-82
-@SuppressWarnings("unchecked")
+// spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/data/SparkParquetWriters.java:80-90
 public static <T> ParquetValueWriter<T> buildWriter(StructType dfSchema, MessageType type) {
-  // 注意：只使用Spark的StructType（dfSchema），不接收Iceberg Schema参数
+  return buildWriter(null, type, dfSchema);
+}
+
+@SuppressWarnings("unchecked")
+public static <T> ParquetValueWriter<T> buildWriter(
+    Schema icebergSchema, MessageType type, StructType dfSchema) {
+  // 注意：虽然接收icebergSchema参数，但优先使用Spark的StructType（dfSchema）
   // 因此无法访问Iceberg Schema中的writeDefault信息
   return (ParquetValueWriter<T>)
-      ParquetWithSparkSchemaVisitor.visit(dfSchema, type, new WriteBuilder(type));
+      ParquetWithSparkSchemaVisitor.visit(
+          dfSchema != null ? dfSchema : SparkSchemaUtil.convert(icebergSchema),
+          type,
+          new WriteBuilder(type));
 }
-```
-
-对比Flink的实现：
-```java
-// Flink使用Iceberg的TypeWithSchemaVisitor，可以访问NestedField的默认值
-GenericParquetWriter.create(Schema schema, MessageType type)  // ← 接收Iceberg Schema
 ```
 
 **2. DDL层面明确拒绝默认值**
@@ -432,18 +450,14 @@ private static void apply(UpdateSchema pendingUpdate, TableChange.AddColumn add)
    └─ 位置：flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/RowDataTaskWriterFactory.java:60-150
    └─ 作用：创建TaskWriter实例
 
-3. 文件Writer：FlinkFileWriterFactory.java
-   └─ 位置：flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkFileWriterFactory.java
+3. Appender工厂：FlinkAppenderFactory.java
+   └─ 位置：flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkAppenderFactory.java:148
    └─ 作用：根据文件格式创建对应Writer
 
 4. Parquet Writer：FlinkParquetWriters.java
-   └─ 位置：flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java
+   └─ 位置：flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java:71-114
    └─ 作用：将RowData转换为Parquet格式
-   └─ ✅ 这里会应用write-default值
-
-5. 通用默认值处理：GenericAppenderFactory.java
-   └─ 位置：core/src/main/java/org/apache/iceberg/data/GenericAppenderFactory.java
-   └─ 作用：Iceberg核心层的默认值填充逻辑
+   └─ ❌ 不会应用write-default值（只使用LogicalType）
 ```
 
 ### 4.2 Spark写入链路
@@ -728,18 +742,17 @@ Flink写入流程：
 |------|---------|----------|
 | Sink入口 | `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/IcebergSink.java` | - |
 | Writer工厂 | `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/RowDataTaskWriterFactory.java` | 60-150 |
-| Parquet Writer | `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java` | - |
-| 测试验证 | `flink/v1.20/flink/src/test/java/org/apache/iceberg/flink/data/TestFlinkParquetWriter.java` | - |
+| Appender工厂 | `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/sink/FlinkAppenderFactory.java` | 148 |
+| Parquet Writer | `flink/v1.20/flink/src/main/java/org/apache/iceberg/flink/data/FlinkParquetWriters.java` | 71-114 |
 
 ### 8.2 Spark相关
 
 | 功能 | 文件路径 | 行号/方法 |
 |------|---------|----------|
 | Write入口 | `spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java` | - |
-| Parquet Writer | `spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/data/SparkParquetWriters.java` | 79-82 |
-| DDL限制 | `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/Spark3Util.java` | 548-558 |
+| Parquet Writer | `spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/data/SparkParquetWriters.java` | 80-90 |
+| DDL限制 | `spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/Spark3Util.java` | 232-246 |
 | Schema转换 | `spark/v4.1/spark/src/main/java/org/apache/iceberg/spark/TypeToSparkType.java` | 76-80 |
-| 测试用例 | `spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/sql/TestSparkDefaultValues.java` | 50-83 |
 
 ### 8.3 Core层
 
@@ -763,6 +776,68 @@ Flink写入流程：
 
 ---
 
+## 十、技术验证与修正记录
+
+### 验证日期：2026-04-20
+
+**验证方法**：对照 Iceberg 源码逐一验证类名、方法名、字段名和行号引用
+
+**发现的错误及修正**：
+
+1. **Spark3Util.java 行号错误**
+   - ❌ 原文档：`548-558`
+   - ✅ 修正为：`232-246`
+   - 验证：实际的 `apply(UpdateSchema, TableChange.AddColumn)` 方法位于第 232-246 行
+
+2. **SparkParquetWriters.java 行号错误**
+   - ❌ 原文档：`79-82`
+   - ✅ 修正为：`80-90`
+   - 验证：`buildWriter` 方法实际包含两个重载版本，完整代码在 80-90 行
+
+3. **FlinkParquetWriters.java 方法签名不完整**
+   - ❌ 原文档：只提到 `buildWriter(LogicalType schema, MessageType type)`
+   - ✅ 修正为：补充了 `buildWriter(Schema icebergSchema, MessageType type, RowType engineSchema)` 重载版本
+   - 验证：实际有两个重载方法（71-78 行），但最终都只使用 LogicalType
+
+4. **FlinkFileWriterFactory.java 引用错误**
+   - ❌ 原文档：引用了 `FlinkFileWriterFactory.java:96` 和 `configureDataWrite` 方法
+   - ✅ 修正为：实际调用位于 `FlinkAppenderFactory.java:148`
+   - 验证：Flink 1.20 版本中使用 `FlinkAppenderFactory` 而非 `FlinkFileWriterFactory`
+
+5. **FlinkParquetWriters.java struct 方法行号错误**
+   - ❌ 原文档：`89-107`
+   - ✅ 修正为：`97-114`
+   - 验证：`struct` 方法实际位于 97-114 行
+
+6. **测试文件路径不存在**
+   - ❌ 原文档：多处引用 `spark/v4.1/spark/src/test/java/org/apache/iceberg/spark/sql/TestSparkDefaultValues.java`
+   - ✅ 修正：添加说明该测试文件在当前代码库中不存在，但功能确实存在于 Spark 4.0+ 版本
+   - 验证：通过 Glob 搜索未找到该文件
+
+7. **Flink 写入链路描述不准确**
+   - ❌ 原文档：提到 `GenericAppenderFactory.java` 会应用 write-default 值
+   - ✅ 修正：删除该说明，Flink 写入链路中不会应用 write-default
+   - 验证：FlinkParquetWriters 只使用 LogicalType，无法访问 writeDefault
+
+8. **索引表格行号更新**
+   - 更新了所有源码索引表格中的行号引用，确保与实际源码一致
+
+**核心结论验证**：
+- ✅ **Flink 不支持 write-default 自动填充**：已验证，FlinkParquetWriters 虽然接收 Schema 参数，但最终只使用 LogicalType
+- ✅ **Spark 不支持 write-default 自动填充**：已验证，Spark3Util.java:237-242 明确抛出 UnsupportedOperationException
+- ✅ **Spark 支持 SQL DEFAULT 关键字**：已验证，TypeToSparkType.java:76-80 将 writeDefault 转换为 currentDefaultValue
+- ✅ **两者都依赖读取端的 initial-default**：逻辑正确
+
+**文档质量评估**：
+- 技术分析逻辑：✅ 正确
+- 核心结论：✅ 准确
+- 代码引用：⚠️ 部分行号错误（已修正）
+- 文件路径：⚠️ 部分测试文件不存在（已标注）
+
+---
+
 **文档作者**: Claude Code (claude-4.5-sonnet)
-**文档状态**: 已验证
-**验证方式**: 源码分析 + 测试用例审查 + Commit历史追溯
+**文档状态**: 已验证并修正
+**验证方式**: 源码分析 + 行号逐一验证
+**验证者**: Claude Code (claude-opus-4-7)
+**验证日期**: 2026-04-20
